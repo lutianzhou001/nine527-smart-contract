@@ -5,7 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
- * @title PVP20
+ * @title nine527
  * @dev A customizable token with deep virtual floor liquidity
  * 
  * Anyone can deploy their own token with:
@@ -18,12 +18,13 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
  * - As users buy, real ETH flows in and mixes with virtual reserves
  * - The constant product formula (x * y = k) ensures price discovery
  */
-contract pvp20 is ERC20, ReentrancyGuard {
+contract nine527 is ERC20, ReentrancyGuard {
     address public immutable DEPLOYER;
     
     // Virtual liquidity parameters - these create the initial price curve
-    uint256 public constant INITIAL_VIRTUAL_ETH = 2100 * (10 ** 18);      // 2100 virtual ETH
-    uint256 public constant INITIAL_TOKEN_RESERVE = 21000 * (10 ** 18);   // 21000 tokens
+    // Initial price: 10 ETH / 100,000,000 tokens = 0.0000001 ETH per token
+    uint256 public constant INITIAL_VIRTUAL_ETH = 10 * (10 ** 18);           // 10 virtual ETH
+    uint256 public constant INITIAL_TOKEN_RESERVE = 100000000 * (10 ** 18);  // 100M tokens (total supply)
 
     ////////////////////////////////////////////////////////////////////////////////
     // Market Configuration
@@ -87,11 +88,13 @@ contract pvp20 is ERC20, ReentrancyGuard {
      * @param tokenName_ The name of the token (e.g., "My Token")
      * @param tokenSymbol_ The symbol of the token (e.g., "MTK")
      * @param treasuryBP_ Treasury fee in basis points (0-300, i.e., 0-3%)
+     * @param deployer_ Address of the token deployer/treasury (use address(0) for msg.sender)
      */
     constructor(
         string memory tokenName_,
         string memory tokenSymbol_,
-        uint256 treasuryBP_
+        uint256 treasuryBP_,
+        address deployer_
     ) ERC20(tokenName_, tokenSymbol_) {
         require(bytes(tokenName_).length > 0, "!name");
         require(bytes(tokenSymbol_).length > 0, "!symbol");
@@ -100,8 +103,12 @@ contract pvp20 is ERC20, ReentrancyGuard {
         _tokenName = tokenName_;
         _tokenSymbol = tokenSymbol_;
         
-        DEPLOYER = msg.sender;
-        treasuryAddr = msg.sender;
+        // If deployer_ is zero address, use msg.sender (for direct deployment)
+        // Otherwise use the provided address (for factory deployment)
+        address actualDeployer = deployer_ == address(0) ? msg.sender : deployer_;
+        
+        DEPLOYER = actualDeployer;
+        treasuryAddr = actualDeployer;
         SELL_TREASURY_BP = treasuryBP_;
         
         // Mint initial token supply to the factory address (virtual reserve)
@@ -392,3 +399,4 @@ contract pvp20 is ERC20, ReentrancyGuard {
 
     receive() external payable {}
 }
+

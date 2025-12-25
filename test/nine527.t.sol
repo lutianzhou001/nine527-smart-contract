@@ -2,25 +2,26 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
-import "../src/pvpfunny.sol";
+import "../src/nine527.sol";
 
-contract pvp20Test is Test {
-    pvp20 public token;
-    pvp20 public tokenWithTreasury;
+contract nine527Test is Test {
+    nine527 public token;
+    nine527 public tokenWithTreasury;
     
     address public deployer = address(this);
     address public alice = address(0xA11CE);
     address public bob = address(0xB0B);
     
-    uint256 constant INITIAL_VIRTUAL_ETH = 2100 * 1e18;
-    uint256 constant INITIAL_TOKEN_RESERVE = 21000 * 1e18;
+    uint256 constant INITIAL_VIRTUAL_ETH = 10 * 1e18;            // 10 ETH
+    uint256 constant INITIAL_TOKEN_RESERVE = 100000000 * 1e18;  // 100M tokens
     
     function setUp() public {
         // Deploy token with custom name, symbol, and 0% treasury fee
-        token = new pvp20("Test Token", "TEST", 0);
+        // address(0) means use msg.sender as deployer
+        token = new nine527("Test Token", "TEST", 0, address(0));
         
         // Deploy another token with 3% treasury fee for treasury tests
-        tokenWithTreasury = new pvp20("Treasury Token", "TRES", 300); // 300 BP = 3%
+        tokenWithTreasury = new nine527("Treasury Token", "TRES", 300, address(0)); // 300 BP = 3%
         
         // Fund test accounts
         vm.deal(alice, 100 ether);
@@ -47,7 +48,7 @@ contract pvp20Test is Test {
 
     function test_Deployment_CustomParams() public {
         // Deploy with different parameters
-        pvp20 customToken = new pvp20("My Meme Coin", "MEME", 150); // 1.5% treasury
+        nine527 customToken = new nine527("My Meme Coin", "MEME", 150, address(0)); // 1.5% treasury
         
         assertEq(customToken.name(), "My Meme Coin");
         assertEq(customToken.symbol(), "MEME");
@@ -55,29 +56,29 @@ contract pvp20Test is Test {
     }
 
     function test_Deployment_ZeroTreasury() public {
-        pvp20 zeroFeeToken = new pvp20("Zero Fee", "ZERO", 0);
+        nine527 zeroFeeToken = new nine527("Zero Fee", "ZERO", 0, address(0));
         assertEq(zeroFeeToken.SELL_TREASURY_BP(), 0);
     }
 
     function test_Deployment_MaxTreasury() public {
-        pvp20 maxFeeToken = new pvp20("Max Fee", "MAX", 300);
+        nine527 maxFeeToken = new nine527("Max Fee", "MAX", 300, address(0));
         assertEq(maxFeeToken.SELL_TREASURY_BP(), 300);
     }
 
     function test_Deployment_RevertOnExcessiveTreasury() public {
         // Should fail with treasury > 3% (300 BP)
         vm.expectRevert(bytes("!treasuryBP>3%"));
-        new pvp20("Bad Token", "BAD", 301);
+        new nine527("Bad Token", "BAD", 301, address(0));
     }
 
     function test_Deployment_RevertOnEmptyName() public {
         vm.expectRevert(bytes("!name"));
-        new pvp20("", "SYM", 100);
+        new nine527("", "SYM", 100, address(0));
     }
 
     function test_Deployment_RevertOnEmptySymbol() public {
         vm.expectRevert(bytes("!symbol"));
-        new pvp20("Name", "", 100);
+        new nine527("Name", "", 100, address(0));
     }
 
     function test_GetTokenInfo() public view {
@@ -107,7 +108,7 @@ contract pvp20Test is Test {
         // ETH reserve should be the virtual amount (no real ETH yet)
         assertEq(token.getEthReserve(), INITIAL_VIRTUAL_ETH);
         
-        // Initial price: 2100 ETH / 21000 tokens = 0.1 ETH per token
+        // Initial price: 10 ETH / 100M tokens = 0.0000001 ETH per token
         uint256 expectedPrice = (INITIAL_VIRTUAL_ETH * 1e18) / INITIAL_TOKEN_RESERVE;
         assertEq(token.getTokenPrice(), expectedPrice);
     }
@@ -495,7 +496,7 @@ contract pvp20Test is Test {
         treasuryBP = bound(treasuryBP, 0, 300);
         
         // Deploy with fuzzed treasury BP
-        pvp20 fuzzToken = new pvp20("Fuzz Token", "FUZZ", treasuryBP);
+        nine527 fuzzToken = new nine527("Fuzz Token", "FUZZ", treasuryBP, address(0));
         assertEq(fuzzToken.SELL_TREASURY_BP(), treasuryBP);
     }
 
@@ -550,3 +551,4 @@ contract pvp20Test is Test {
     // Receive function to accept ETH (for treasury withdrawal test)
     receive() external payable {}
 }
+

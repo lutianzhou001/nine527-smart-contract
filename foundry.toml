@@ -6,4 +6,9 @@ remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"
 ]
 
+# Optimizer settings for smaller bytecode
+optimizer = true
+optimizer_runs = 1  # Low runs = smaller bytecode, higher gas per call
+via_ir = true       # Use new IR pipeline for better optimization
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
