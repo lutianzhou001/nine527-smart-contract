@@ -3,25 +3,33 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
 import "../src/nine527.sol";
+import "../src/nine527Factory.sol";
 
 contract nine527Test is Test {
     nine527 public token;
     nine527 public tokenWithTreasury;
+    nine527Factory public factory;
     
     address public deployer = address(this);
     address public alice = address(0xA11CE);
     address public bob = address(0xB0B);
     
-    uint256 constant INITIAL_VIRTUAL_ETH = 10 * 1e18;            // 10 ETH
-    uint256 constant INITIAL_TOKEN_RESERVE = 100000000 * 1e18;  // 100M tokens
+    // USD-equivalent virtual native (~$2,600 worth at $3,000/ETH)
+    // TARGET_USD_CENTS = 260000, ETH price = 300000 cents
+    // virtualNative = (260000 * 1e18) / 300000 = 0.8666... ETH
+    uint256 constant VIRTUAL_NATIVE = 866666666666666666; // ~0.867 ETH (260000 * 1e18 / 300000)
+    uint256 constant INITIAL_TOKEN_RESERVE = 1000000000 * 1e18; // 1B tokens
     
     function setUp() public {
-        // Deploy token with custom name, symbol, and 0% treasury fee
+        // Deploy factory first
+        factory = new nine527Factory();
+        
+        // Deploy token with custom name, symbol, 0% treasury fee, and virtual native
         // address(0) means use msg.sender as deployer
-        token = new nine527("Test Token", "TEST", 0, address(0));
+        token = new nine527("Test Token", "TEST", 0, address(0), VIRTUAL_NATIVE);
         
         // Deploy another token with 3% treasury fee for treasury tests
-        tokenWithTreasury = new nine527("Treasury Token", "TRES", 300, address(0)); // 300 BP = 3%
+        tokenWithTreasury = new nine527("Treasury Token", "TRES", 300, address(0), VIRTUAL_NATIVE); // 300 BP = 3%
         
         // Fund test accounts
         vm.deal(alice, 100 ether);
@@ -38,6 +46,7 @@ contract nine527Test is Test {
         assertEq(token.DEPLOYER(), deployer);
         assertEq(token.treasuryAddr(), deployer);
         assertEq(token.SELL_TREASURY_BP(), 0);
+        assertEq(token.INITIAL_VIRTUAL_NATIVE(), VIRTUAL_NATIVE);
     }
 
     function test_Deployment_WithTreasury() public view {
@@ -48,7 +57,7 @@ contract nine527Test is Test {
 
     function test_Deployment_CustomParams() public {
         // Deploy with different parameters
-        nine527 customToken = new nine527("My Meme Coin", "MEME", 150, address(0)); // 1.5% treasury
+        nine527 customToken = new nine527("My Meme Coin", "MEME", 150, address(0), VIRTUAL_NATIVE); // 1.5% treasury
         
         assertEq(customToken.name(), "My Meme Coin");
         assertEq(customToken.symbol(), "MEME");
@@ -56,29 +65,34 @@ contract nine527Test is Test {
     }
 
     function test_Deployment_ZeroTreasury() public {
-        nine527 zeroFeeToken = new nine527("Zero Fee", "ZERO", 0, address(0));
+        nine527 zeroFeeToken = new nine527("Zero Fee", "ZERO", 0, address(0), VIRTUAL_NATIVE);
         assertEq(zeroFeeToken.SELL_TREASURY_BP(), 0);
     }
 
     function test_Deployment_MaxTreasury() public {
-        nine527 maxFeeToken = new nine527("Max Fee", "MAX", 300, address(0));
+        nine527 maxFeeToken = new nine527("Max Fee", "MAX", 300, address(0), VIRTUAL_NATIVE);
         assertEq(maxFeeToken.SELL_TREASURY_BP(), 300);
     }
 
     function test_Deployment_RevertOnExcessiveTreasury() public {
         // Should fail with treasury > 3% (300 BP)
         vm.expectRevert(bytes("!treasuryBP>3%"));
-        new nine527("Bad Token", "BAD", 301, address(0));
+        new nine527("Bad Token", "BAD", 301, address(0), VIRTUAL_NATIVE);
     }
 
     function test_Deployment_RevertOnEmptyName() public {
         vm.expectRevert(bytes("!name"));
-        new nine527("", "SYM", 100, address(0));
+        new nine527("", "SYM", 100, address(0), VIRTUAL_NATIVE);
     }
 
     function test_Deployment_RevertOnEmptySymbol() public {
         vm.expectRevert(bytes("!symbol"));
-        new nine527("Name", "", 100, address(0));
+        new nine527("Name", "", 100, address(0), VIRTUAL_NATIVE);
+    }
+    
+    function test_Deployment_RevertOnZeroVirtualNative() public {
+        vm.expectRevert(bytes("!virtualNative"));
+        new nine527("Bad Token", "BAD", 100, address(0), 0);
     }
 
     function test_GetTokenInfo() public view {
@@ -88,7 +102,7 @@ contract nine527Test is Test {
             address tokenDeployer,
             uint256 treasuryFeeBP,
             uint256 currentPrice,
-            uint256 ethReserve,
+            uint256 nativeReserve,
             uint256 tokenReserve
         ) = token.getTokenInfo();
         
@@ -97,7 +111,7 @@ contract nine527Test is Test {
         assertEq(tokenDeployer, deployer);
         assertEq(treasuryFeeBP, 0);
         assertGt(currentPrice, 0);
-        assertEq(ethReserve, INITIAL_VIRTUAL_ETH);
+        assertEq(nativeReserve, VIRTUAL_NATIVE);
         assertEq(tokenReserve, INITIAL_TOKEN_RESERVE);
     }
 
@@ -105,12 +119,108 @@ contract nine527Test is Test {
         // Token reserve should be minted to factory address
         assertEq(token.getTokenReserve(), INITIAL_TOKEN_RESERVE);
         
-        // ETH reserve should be the virtual amount (no real ETH yet)
-        assertEq(token.getEthReserve(), INITIAL_VIRTUAL_ETH);
+        // Native reserve should be the virtual amount (no real native yet)
+        assertEq(token.getEthReserve(), VIRTUAL_NATIVE);
         
-        // Initial price: 10 ETH / 100M tokens = 0.0000001 ETH per token
-        uint256 expectedPrice = (INITIAL_VIRTUAL_ETH * 1e18) / INITIAL_TOKEN_RESERVE;
+        // Initial price calculation
+        uint256 expectedPrice = (VIRTUAL_NATIVE * 1e18) / INITIAL_TOKEN_RESERVE;
         assertEq(token.getTokenPrice(), expectedPrice);
+    }
+    
+    function test_VirtualReserveGetter() public view {
+        assertEq(token.getVirtualReserve(), VIRTUAL_NATIVE);
+    }
+    
+    function test_NativeReserveGetter() public view {
+        // Before any trades, real native reserve is 0
+        assertEq(token.getNativeReserve(), 0);
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // Factory Tests
+    ////////////////////////////////////////////////////////////////////////////////
+    
+    function test_Factory_GetVirtualNativeForChain() public view {
+        // On mainnet fork or localhost (chainid 31337), should return ~0.867 ETH
+        uint256 virtualNative = factory.getVirtualNativeForChain();
+        assertGt(virtualNative, 0);
+        // Should be approximately 0.867 ETH for ETH-priced chains
+        assertApproxEqRel(virtualNative, VIRTUAL_NATIVE, 0.01e18); // 1% tolerance
+    }
+    
+    function test_Factory_CreateTokenSimple() public {
+        vm.deal(address(this), 1 ether);
+        
+        address tokenAddr = factory.createTokenSimple{value: 0.1 ether}(
+            "Factory Token",
+            "FACT",
+            100
+        );
+        
+        assertTrue(tokenAddr != address(0));
+        assertTrue(factory.isValidToken(tokenAddr));
+        assertEq(factory.totalTokens(), 1);
+        
+        nine527 createdToken = nine527(payable(tokenAddr));
+        assertEq(createdToken.name(), "Factory Token");
+        assertEq(createdToken.DEPLOYER(), address(this));
+    }
+    
+    function test_Factory_CreateTokenSimpleAndBuy() public {
+        vm.deal(address(this), 2 ether);
+        
+        (address tokenAddr, uint256 tokensReceived) = factory.createTokenSimpleAndBuy{value: 1 ether}(
+            "Buy Token",
+            "BUY",
+            100,
+            1 // minTokenAmt
+        );
+        
+        assertTrue(tokenAddr != address(0));
+        assertGt(tokensReceived, 0);
+        
+        nine527 createdToken = nine527(payable(tokenAddr));
+        assertEq(createdToken.balanceOf(address(this)), tokensReceived);
+    }
+    
+    function test_Factory_AccumulatedFees() public {
+        vm.deal(address(this), 1 ether);
+        
+        factory.createTokenSimple{value: 0.1 ether}("Fee Test", "FEE", 100);
+        
+        assertEq(factory.accumulatedFees(), 0.1 ether);
+    }
+    
+    function test_Factory_WithdrawFees() public {
+        vm.deal(address(this), 1 ether);
+        
+        factory.createTokenSimple{value: 0.1 ether}("Fee Test", "FEE", 100);
+        
+        uint256 balanceBefore = address(this).balance;
+        factory.withdrawFees();
+        
+        assertEq(factory.accumulatedFees(), 0);
+        assertEq(address(this).balance, balanceBefore + 0.1 ether);
+    }
+    
+    function test_Factory_SetNativePrice() public {
+        factory.setNativePrice(999, 50000); // Custom chain at $500
+        assertEq(factory.nativePriceUSDCents(999), 50000);
+    }
+    
+    function test_Factory_SetNativePricesBatch() public {
+        uint256[] memory chainIds = new uint256[](2);
+        uint256[] memory prices = new uint256[](2);
+        
+        chainIds[0] = 888;
+        chainIds[1] = 777;
+        prices[0] = 100000; // $1,000
+        prices[1] = 200000; // $2,000
+        
+        factory.setNativePricesBatch(chainIds, prices);
+        
+        assertEq(factory.nativePriceUSDCents(888), 100000);
+        assertEq(factory.nativePriceUSDCents(777), 200000);
     }
 
     ////////////////////////////////////////////////////////////////////////////////
@@ -131,8 +241,8 @@ contract nine527Test is Test {
         // Check alice received tokens
         assertGt(token.balanceOf(alice), 0, "Alice should have tokens");
         
-        // ETH reserve should increase
-        assertEq(token.getEthReserve(), INITIAL_VIRTUAL_ETH + buyAmount);
+        // Native reserve should increase
+        assertEq(token.getEthReserve(), VIRTUAL_NATIVE + buyAmount);
         
         // Token reserve should decrease
         assertLt(token.getTokenReserve(), INITIAL_TOKEN_RESERVE);
@@ -188,17 +298,17 @@ contract nine527Test is Test {
         
         // Estimate sell return
         uint256 sellAmount = tokenBalance / 2;
-        uint256 estimatedEth = token.estimateSellReturn(sellAmount);
-        assertTrue(estimatedEth > 0, "Should receive ETH");
+        uint256 estimatedNative = token.estimateSellReturn(sellAmount);
+        assertTrue(estimatedNative > 0, "Should receive native");
         
-        uint256 aliceEthBefore = alice.balance;
+        uint256 aliceNativeBefore = alice.balance;
         
         // Sell tokens
         vm.prank(alice, alice);
         token.sellToken(sellAmount, 1, 0);
         
-        // Check alice received ETH
-        assertGt(alice.balance, aliceEthBefore, "Alice should receive ETH");
+        // Check alice received native
+        assertGt(alice.balance, aliceNativeBefore, "Alice should receive native");
         
         // Check token balance decreased
         assertLt(token.balanceOf(alice), tokenBalance, "Token balance should decrease");
@@ -231,14 +341,14 @@ contract nine527Test is Test {
         token.buyToken{value: 10 ether}(1, 0);
         uint256 tokenBalance = token.balanceOf(alice);
         
-        // Should fail with too high min ETH
+        // Should fail with too high min native
         vm.prank(alice, alice);
         vm.expectRevert(bytes("INSUFFICIENT_OUTPUT_AMOUNT"));
         token.sellToken(tokenBalance / 2, 100 ether, 0);
     }
 
     ////////////////////////////////////////////////////////////////////////////////
-    // Treasury Fee Tests
+    // Treasury Fee Tests (with Factory Fee Share)
     ////////////////////////////////////////////////////////////////////////////////
 
     function test_TreasuryFee_OnSell() public {
@@ -251,19 +361,45 @@ contract nine527Test is Test {
         uint256 tokenBalance = tokenWithTreasury.balanceOf(alice);
         
         uint256 sellAmount = tokenBalance / 2;
-        uint256 aliceEthBefore = alice.balance;
+        uint256 aliceNativeBefore = alice.balance;
         uint256 treasuryBefore = tokenWithTreasury.treasuryAmtTotal();
+        uint256 factoryFeesBefore = tokenWithTreasury.factoryFeesAccrued();
         
         // Sell tokens
         vm.prank(alice, alice);
         tokenWithTreasury.sellToken(sellAmount, 1, 0);
         
-        // Treasury should have accumulated fees
+        // Treasury should have accumulated fees (90% of 3%)
         uint256 treasuryAfter = tokenWithTreasury.treasuryAmtTotal();
         assertGt(treasuryAfter, treasuryBefore, "Treasury should accumulate fees");
         
-        // Alice should have received ETH (minus fee)
-        assertGt(alice.balance, aliceEthBefore, "Alice should receive ETH");
+        // Factory should have accumulated fees (10% of 3%)
+        uint256 factoryFeesAfter = tokenWithTreasury.factoryFeesAccrued();
+        assertGt(factoryFeesAfter, factoryFeesBefore, "Factory should accumulate fees");
+        
+        // Alice should have received native (minus fee)
+        assertGt(alice.balance, aliceNativeBefore, "Alice should receive native");
+    }
+    
+    function test_TreasuryFee_FeeShareRatio() public {
+        // Use tokenWithTreasury (3% fee)
+        vm.deal(alice, 100 ether);
+        
+        // Buy and sell to generate fees
+        vm.prank(alice, alice);
+        tokenWithTreasury.buyToken{value: 10 ether}(1, 0);
+        uint256 tokenBalance = tokenWithTreasury.balanceOf(alice);
+        
+        vm.prank(alice, alice);
+        tokenWithTreasury.sellToken(tokenBalance / 2, 1, 0);
+        
+        uint256 treasuryFees = tokenWithTreasury.treasuryAmtTotal();
+        uint256 factoryFees = tokenWithTreasury.factoryFeesAccrued();
+        
+        // Factory gets 10%, treasury gets 90%
+        // So factoryFees should be ~1/9 of treasuryFees (10/90 = 1/9)
+        // Allow some tolerance for rounding
+        assertApproxEqRel(factoryFees * 9, treasuryFees, 0.01e18); // 1% tolerance
     }
 
     function test_TreasuryFee_Withdrawal() public {
@@ -293,17 +429,17 @@ contract nine527Test is Test {
 
     function test_TreasuryFee_EstimateIncludesFee() public {
         // Compare estimates between 0% and 3% treasury
-        uint256 ethAmount = 10 ether;
+        uint256 nativeAmount = 10 ether;
         
         // Buy same amount on both
         vm.deal(alice, 200 ether);
         
         vm.prank(alice, alice);
-        token.buyToken{value: ethAmount}(1, 0);
+        token.buyToken{value: nativeAmount}(1, 0);
         uint256 tokensNoFee = token.balanceOf(alice);
         
         vm.prank(alice, alice);
-        tokenWithTreasury.buyToken{value: ethAmount}(1, 0);
+        tokenWithTreasury.buyToken{value: nativeAmount}(1, 0);
         uint256 tokensWithFee = tokenWithTreasury.balanceOf(alice);
         
         // Buy amounts should be same (no fee on buy)
@@ -424,9 +560,9 @@ contract nine527Test is Test {
     // Edge Cases
     ////////////////////////////////////////////////////////////////////////////////
 
-    function test_RevertOnZeroEth() public {
+    function test_RevertOnZeroNative() public {
         vm.prank(alice, alice);
-        vm.expectRevert(bytes("!eth"));
+        vm.expectRevert(bytes("!native"));
         token.buyToken{value: 0}(1, 0);
     }
 
@@ -442,13 +578,13 @@ contract nine527Test is Test {
         token.sellToken(0, 1, 0);
     }
 
-    function test_RevertOnZeroMinEth() public {
+    function test_RevertOnZeroMinNative() public {
         // Buy first
         vm.prank(alice, alice);
         token.buyToken{value: 1 ether}(1, 0);
         
         vm.prank(alice, alice);
-        vm.expectRevert(bytes("!minEth"));
+        vm.expectRevert(bytes("!minNative"));
         token.sellToken(1000, 0, 0);
     }
 
@@ -496,7 +632,7 @@ contract nine527Test is Test {
         treasuryBP = bound(treasuryBP, 0, 300);
         
         // Deploy with fuzzed treasury BP
-        nine527 fuzzToken = new nine527("Fuzz Token", "FUZZ", treasuryBP, address(0));
+        nine527 fuzzToken = new nine527("Fuzz Token", "FUZZ", treasuryBP, address(0), VIRTUAL_NATIVE);
         assertEq(fuzzToken.SELL_TREASURY_BP(), treasuryBP);
     }
 
@@ -534,12 +670,12 @@ contract nine527Test is Test {
         // Final checks
         assertTrue(token.totalSupply() > 0, "Supply should remain");
         assertTrue(token.getTokenReserve() > 0, "Reserve should remain");
-        assertTrue(token.getEthReserve() > 0, "ETH reserve should remain");
+        assertTrue(token.getEthReserve() > 0, "Native reserve should remain");
     }
 
-    function test_VirtualLiquidity_NoInitialEth() public view {
-        // Contract should work without any real ETH due to virtual liquidity
-        // Price calculations work because of INITIAL_VIRTUAL_ETH
+    function test_VirtualLiquidity_NoInitialNative() public view {
+        // Contract should work without any real native due to virtual liquidity
+        // Price calculations work because of INITIAL_VIRTUAL_NATIVE
         
         uint256 price = token.getTokenPrice();
         assertTrue(price > 0, "Price should be positive from virtual liquidity");
@@ -548,7 +684,6 @@ contract nine527Test is Test {
         assertTrue(estimatedTokens > 0, "Should estimate tokens correctly");
     }
 
-    // Receive function to accept ETH (for treasury withdrawal test)
+    // Receive function to accept native (for treasury withdrawal test)
     receive() external payable {}
 }
-

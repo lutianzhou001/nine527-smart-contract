@@ -12,19 +12,26 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
  * - Custom name and symbol
  * - Configurable treasury fee (0-3%)
  * 
- * Virtual Liquidity Mechanism:
- * - The contract starts with VIRTUAL ETH and TOKEN reserves
- * - No actual ETH is required at deployment - it's "virtual"
- * - As users buy, real ETH flows in and mixes with virtual reserves
+ * Virtual Liquidity Mechanism (Four.meme Style):
+ * - Uses USD-equivalent virtual reserves (~$2,600 worth)
+ * - Chain-aware pricing for fair launches across all EVM chains
+ * - As users buy, real native tokens flow in and mix with virtual reserves
  * - The constant product formula (x * y = k) ensures price discovery
+ * 
+ * Fee Structure:
+ * - Treasury fee on sells: 0-3% (set by deployer)
+ * - Factory fee share: 10% of treasury fee goes to factory
  */
 contract nine527 is ERC20, ReentrancyGuard {
     address public immutable DEPLOYER;
+    address public immutable FACTORY;
     
-    // Virtual liquidity parameters - these create the initial price curve
-    // Initial price: 10 ETH / 100,000,000 tokens = 0.0000001 ETH per token
-    uint256 public constant INITIAL_VIRTUAL_ETH = 10 * (10 ** 18);           // 10 virtual ETH
-    uint256 public constant INITIAL_TOKEN_RESERVE = 100000000 * (10 ** 18);  // 100M tokens (total supply)
+    // Virtual liquidity parameters - USD-equivalent (~$2,600 worth of native token)
+    // This is passed from the factory based on chain ID
+    uint256 public immutable INITIAL_VIRTUAL_NATIVE;
+    
+    // Token supply: 1 billion tokens
+    uint256 public constant INITIAL_TOKEN_RESERVE = 1000000000 * (10 ** 18); // 1B tokens
 
     ////////////////////////////////////////////////////////////////////////////////
     // Market Configuration
@@ -48,6 +55,9 @@ contract nine527 is ERC20, ReentrancyGuard {
     // Treasury fee on sells - set by deployer (0-300 BP = 0-3%)
     uint256 public immutable SELL_TREASURY_BP;
     uint256 public constant MAX_TREASURY_BP = 300;  // Max 3%
+    
+    // Factory fee share: 10% of treasury fees go to factory
+    uint256 public constant FACTORY_FEE_SHARE_BP = 1000; // 10% in basis points
 
     ////////////////////////////////////////////////////////////////////////////////
     // Anti-bot Configuration
@@ -64,9 +74,13 @@ contract nine527 is ERC20, ReentrancyGuard {
 
     address public treasuryAddr;
     uint256 public treasuryAmtTotal;
+    uint256 public factoryFeesAccrued;
 
     // Flag to skip burn during internal transfers (buy/sell operations)
     bool private _skipBurn;
+    
+    // Flag to bypass anti-bot for deployer's initial buy
+    bool private _isDeployerBuy;
 
     // Store token metadata for display
     string private _tokenName;
@@ -76,8 +90,9 @@ contract nine527 is ERC20, ReentrancyGuard {
     // Events
     ////////////////////////////////////////////////////////////////////////////////
 
-    event BuyToken(address indexed user, uint256 tokenAmt, uint256 ethAmt);
-    event SellToken(address indexed user, uint256 tokenAmt, uint256 ethAmt);
+    event BuyToken(address indexed user, uint256 tokenAmt, uint256 nativeAmt);
+    event SellToken(address indexed user, uint256 tokenAmt, uint256 nativeAmt);
+    event FactoryFeesWithdrawn(address indexed factory, uint256 amount);
 
     ////////////////////////////////////////////////////////////////////////////////
     // Constructor
@@ -88,17 +103,20 @@ contract nine527 is ERC20, ReentrancyGuard {
      * @param tokenName_ The name of the token (e.g., "My Token")
      * @param tokenSymbol_ The symbol of the token (e.g., "MTK")
      * @param treasuryBP_ Treasury fee in basis points (0-300, i.e., 0-3%)
-     * @param deployer_ Address of the token deployer/treasury (use address(0) for msg.sender)
+     * @param deployer_ Address of the token deployer/treasury
+     * @param virtualNative_ USD-equivalent virtual native reserve (from factory)
      */
     constructor(
         string memory tokenName_,
         string memory tokenSymbol_,
         uint256 treasuryBP_,
-        address deployer_
+        address deployer_,
+        uint256 virtualNative_
     ) ERC20(tokenName_, tokenSymbol_) {
         require(bytes(tokenName_).length > 0, "!name");
         require(bytes(tokenSymbol_).length > 0, "!symbol");
         require(treasuryBP_ <= MAX_TREASURY_BP, "!treasuryBP>3%");
+        require(virtualNative_ > 0, "!virtualNative");
         
         _tokenName = tokenName_;
         _tokenSymbol = tokenSymbol_;
@@ -108,8 +126,10 @@ contract nine527 is ERC20, ReentrancyGuard {
         address actualDeployer = deployer_ == address(0) ? msg.sender : deployer_;
         
         DEPLOYER = actualDeployer;
+        FACTORY = msg.sender;
         treasuryAddr = actualDeployer;
         SELL_TREASURY_BP = treasuryBP_;
+        INITIAL_VIRTUAL_NATIVE = virtualNative_;
         
         // Mint initial token supply to the factory address (virtual reserve)
         _mint(TOKEN_FACTORY_ADDR, INITIAL_TOKEN_RESERVE);
@@ -120,11 +140,25 @@ contract nine527 is ERC20, ReentrancyGuard {
     ////////////////////////////////////////////////////////////////////////////////
 
     /**
-     * @dev Returns the effective ETH reserve (virtual + real ETH - treasury)
+     * @dev Returns the virtual native reserve (for display)
+     */
+    function getVirtualReserve() public view returns (uint256) {
+        return INITIAL_VIRTUAL_NATIVE;
+    }
+
+    /**
+     * @dev Returns the actual native token balance (real liquidity)
+     */
+    function getNativeReserve() public view returns (uint256) {
+        return address(this).balance - treasuryAmtTotal - factoryFeesAccrued;
+    }
+
+    /**
+     * @dev Returns the effective native reserve (virtual + real - fees)
      * This is used for AMM price calculations
      */
     function getEthReserve() public view returns (uint256) {
-        return INITIAL_VIRTUAL_ETH + address(this).balance - treasuryAmtTotal;
+        return INITIAL_VIRTUAL_NATIVE + address(this).balance - treasuryAmtTotal - factoryFeesAccrued;
     }
 
     /**
@@ -135,34 +169,34 @@ contract nine527 is ERC20, ReentrancyGuard {
     }
 
     /**
-     * @dev Calculate current token price in ETH (per token)
+     * @dev Calculate current token price in native token (per token)
      */
     function getTokenPrice() public view returns (uint256) {
-        uint256 ethReserve = getEthReserve();
+        uint256 nativeReserve = getEthReserve();
         uint256 tokenReserve = getTokenReserve();
         if (tokenReserve == 0) return 0;
-        return (ethReserve * 1e18) / tokenReserve;
+        return (nativeReserve * 1e18) / tokenReserve;
     }
 
     /**
-     * @dev Estimate tokens received for a given ETH amount
+     * @dev Estimate tokens received for a given native amount
      */
-    function estimateBuyReturn(uint256 ethAmount) public view returns (uint256) {
-        if (ethAmount == 0) return 0;
+    function estimateBuyReturn(uint256 nativeAmount) public view returns (uint256) {
+        if (nativeAmount == 0) return 0;
         
-        uint256 oldEthReserve = getEthReserve();
-        uint256 newEthReserve = oldEthReserve + ethAmount;
+        uint256 oldNativeReserve = getEthReserve();
+        uint256 newNativeReserve = oldNativeReserve + nativeAmount;
         uint256 oldTokenReserve = getTokenReserve();
         
         // Constant product formula: x * y = k
-        // newTokenReserve = (oldEthReserve * oldTokenReserve) / newEthReserve
-        uint256 newTokenReserve = (oldEthReserve * oldTokenReserve + newEthReserve / 2) / newEthReserve;
+        // newTokenReserve = (oldNativeReserve * oldTokenReserve) / newNativeReserve
+        uint256 newTokenReserve = (oldNativeReserve * oldTokenReserve + newNativeReserve / 2) / newNativeReserve;
         
         return oldTokenReserve - newTokenReserve;
     }
 
     /**
-     * @dev Estimate ETH received for selling tokens (after treasury fee)
+     * @dev Estimate native received for selling tokens (after treasury fee)
      */
     function estimateSellReturn(uint256 tokenAmount) public view returns (uint256) {
         if (tokenAmount == 0) return 0;
@@ -170,20 +204,20 @@ contract nine527 is ERC20, ReentrancyGuard {
         uint256 burnAmt = (tokenAmount * SELL_BURN_BP) / 10000;
         uint256 tokenAmtAfterBurn = tokenAmount - burnAmt;
         
-        uint256 oldEthReserve = getEthReserve();
+        uint256 oldNativeReserve = getEthReserve();
         uint256 oldTokenReserve = getTokenReserve();
         
         uint256 newTokenReserve = oldTokenReserve + tokenAmtAfterBurn;
-        uint256 newEthReserve = (oldEthReserve * oldTokenReserve + newTokenReserve / 2) / newTokenReserve;
+        uint256 newNativeReserve = (oldNativeReserve * oldTokenReserve + newTokenReserve / 2) / newTokenReserve;
         
-        uint256 grossEth = oldEthReserve - newEthReserve;
+        uint256 grossNative = oldNativeReserve - newNativeReserve;
         
         // Deduct treasury fee from output
         if (SELL_TREASURY_BP > 0) {
-            uint256 treasuryAmt = (grossEth * SELL_TREASURY_BP) / 10000;
-            return grossEth - treasuryAmt;
+            uint256 treasuryAmt = (grossNative * SELL_TREASURY_BP) / 10000;
+            return grossNative - treasuryAmt;
         }
-        return grossEth;
+        return grossNative;
     }
 
     /**
@@ -195,7 +229,7 @@ contract nine527 is ERC20, ReentrancyGuard {
         address deployer,
         uint256 treasuryFeeBP,
         uint256 currentPrice,
-        uint256 ethReserve,
+        uint256 nativeReserve,
         uint256 tokenReserve
     ) {
         return (
@@ -214,29 +248,55 @@ contract nine527 is ERC20, ReentrancyGuard {
     ////////////////////////////////////////////////////////////////////////////////
 
     /**
-     * @dev Buy tokens with ETH
+     * @dev Buy tokens with native token
      * @param minTokenAmt Minimum tokens to receive (slippage protection)
      * @param expireTimestamp Transaction deadline (0 for no deadline)
      */
     function buyToken(uint256 minTokenAmt, uint256 expireTimestamp) external payable nonReentrant {
-        address user = msg.sender;
-
-        // Anti-bot checks
-        if (CONTRACT_CHECK_BUY_LEVEL % 2 == 1) require(!_isContract(user), "!human");
-        if (CONTRACT_CHECK_BUY_LEVEL >= 2) require(user == tx.origin, "!human");
+        _buyToken(msg.sender, minTokenAmt, expireTimestamp, false);
+    }
+    
+    /**
+     * @dev Internal buy function called by factory for deployer's initial buy
+     * @param buyer Address receiving the tokens
+     * @param minTokenAmt Minimum tokens to receive
+     * @param expireTimestamp Transaction deadline
+     * @param bypassAntiBot Whether to bypass anti-bot (true for deployer initial buy)
+     */
+    function buyTokenFor(
+        address buyer,
+        uint256 minTokenAmt,
+        uint256 expireTimestamp,
+        bool bypassAntiBot
+    ) external payable nonReentrant {
+        require(msg.sender == FACTORY, "!factory");
+        _buyToken(buyer, minTokenAmt, expireTimestamp, bypassAntiBot);
+    }
+    
+    function _buyToken(
+        address user,
+        uint256 minTokenAmt,
+        uint256 expireTimestamp,
+        bool bypassAntiBot
+    ) internal {
+        // Anti-bot checks (can be bypassed for deployer's initial buy)
+        if (!bypassAntiBot) {
+            if (CONTRACT_CHECK_BUY_LEVEL % 2 == 1) require(!_isContract(user), "!human");
+            if (CONTRACT_CHECK_BUY_LEVEL >= 2) require(user == tx.origin, "!human");
+        }
 
         require(MARKET_OPEN_STAGE > 0, "!market");
-        require(msg.value > 0, "!eth");
+        require(msg.value > 0, "!native");
         require(minTokenAmt > 0, "!minToken");
         require(expireTimestamp == 0 || block.timestamp <= expireTimestamp, "!expire");
-        require(MARKET_BUY_ETH_LIMIT == 0 || msg.value <= MARKET_BUY_ETH_LIMIT, "!ethLimit");
+        require(MARKET_BUY_ETH_LIMIT == 0 || msg.value <= MARKET_BUY_ETH_LIMIT, "!nativeLimit");
 
         // Calculate output using constant product formula
-        uint256 newEthReserve = INITIAL_VIRTUAL_ETH + address(this).balance - treasuryAmtTotal;
-        uint256 oldEthReserve = newEthReserve - msg.value;
+        uint256 newNativeReserve = INITIAL_VIRTUAL_NATIVE + address(this).balance - treasuryAmtTotal - factoryFeesAccrued;
+        uint256 oldNativeReserve = newNativeReserve - msg.value;
 
         uint256 oldTokenReserve = balanceOf(TOKEN_FACTORY_ADDR);
-        uint256 newTokenReserve = (oldEthReserve * oldTokenReserve + newEthReserve / 2) / newEthReserve;
+        uint256 newTokenReserve = (oldNativeReserve * oldTokenReserve + newNativeReserve / 2) / newNativeReserve;
 
         uint256 outTokenAmt = oldTokenReserve - newTokenReserve;
         require(outTokenAmt > 0, "!outToken");
@@ -259,20 +319,20 @@ contract nine527 is ERC20, ReentrancyGuard {
     }
 
     /**
-     * @dev Sell tokens for ETH
+     * @dev Sell tokens for native token
      * @param tokenAmt Amount of tokens to sell
-     * @param minEthAmt Minimum ETH to receive (slippage protection)
+     * @param minNativeAmt Minimum native to receive (slippage protection)
      * @param expireTimestamp Transaction deadline (0 for no deadline)
      */
-    function sellToken(uint256 tokenAmt, uint256 minEthAmt, uint256 expireTimestamp) external nonReentrant {
-        address payable user = payable(msg.sender);
+    function sellToken(uint256 tokenAmt, uint256 minNativeAmt, uint256 expireTimestamp) external nonReentrant {
+        address user = msg.sender;
 
         // Anti-bot checks
         if (CONTRACT_CHECK_SELL_LEVEL % 2 == 1) require(!_isContract(user), "!human");
         if (CONTRACT_CHECK_SELL_LEVEL >= 2) require(user == tx.origin, "!human");
 
         require(tokenAmt > 0, "!token");
-        require(minEthAmt > 0, "!minEth");
+        require(minNativeAmt > 0, "!minNative");
         require(expireTimestamp == 0 || block.timestamp <= expireTimestamp, "!expire");
 
         // Apply sell burn (if any)
@@ -280,32 +340,38 @@ contract nine527 is ERC20, ReentrancyGuard {
         _burnWithAutoBoost(user, burnAmt);
         uint256 tokenAmtAfterBurn = tokenAmt - burnAmt;
 
-        // Calculate ETH output using constant product formula
-        uint256 oldEthReserve = INITIAL_VIRTUAL_ETH + address(this).balance - treasuryAmtTotal;
+        // Calculate native output using constant product formula
+        uint256 oldNativeReserve = INITIAL_VIRTUAL_NATIVE + address(this).balance - treasuryAmtTotal - factoryFeesAccrued;
         uint256 oldTokenReserve = balanceOf(TOKEN_FACTORY_ADDR);
 
         uint256 newTokenReserve = oldTokenReserve + tokenAmtAfterBurn;
-        uint256 newEthReserve = (oldEthReserve * oldTokenReserve + newTokenReserve / 2) / newTokenReserve;
+        uint256 newNativeReserve = (oldNativeReserve * oldTokenReserve + newTokenReserve / 2) / newTokenReserve;
 
-        uint256 outEthAmt = oldEthReserve - newEthReserve;
-        require(outEthAmt > 0, "!outEth");
+        uint256 outNativeAmt = oldNativeReserve - newNativeReserve;
+        require(outNativeAmt > 0, "!outNative");
 
         // Transfer tokens from user to factory (no additional burn)
         _transferNoBurn(user, TOKEN_FACTORY_ADDR, tokenAmtAfterBurn);
 
-        // Send ETH to user (minus treasury fee if any)
+        // Calculate and distribute fees
+        uint256 userReceives = outNativeAmt;
         if (SELL_TREASURY_BP > 0) {
-            uint256 treasuryAmt = (outEthAmt * SELL_TREASURY_BP) / 10000;
-            treasuryAmtTotal += treasuryAmt;
-            uint256 userReceives = outEthAmt - treasuryAmt;
-            require(userReceives >= minEthAmt, "INSUFFICIENT_OUTPUT_AMOUNT");
-            user.transfer(userReceives);
-        } else {
-            require(outEthAmt >= minEthAmt, "INSUFFICIENT_OUTPUT_AMOUNT");
-            user.transfer(outEthAmt);
+            uint256 totalFee = (outNativeAmt * SELL_TREASURY_BP) / 10000;
+            uint256 factoryShare = (totalFee * FACTORY_FEE_SHARE_BP) / 10000; // 10% to factory
+            uint256 treasuryShare = totalFee - factoryShare; // 90% to deployer
+            
+            factoryFeesAccrued += factoryShare;
+            treasuryAmtTotal += treasuryShare;
+            userReceives = outNativeAmt - totalFee;
         }
+        
+        require(userReceives >= minNativeAmt, "INSUFFICIENT_OUTPUT_AMOUNT");
+        
+        // Safe transfer using call instead of transfer
+        (bool success, ) = payable(user).call{value: userReceives}("");
+        require(success, "!transfer");
 
-        emit SellToken(user, tokenAmt, outEthAmt);
+        emit SellToken(user, tokenAmt, outNativeAmt);
     }
 
     ////////////////////////////////////////////////////////////////////////////////
@@ -390,13 +456,36 @@ contract nine527 is ERC20, ReentrancyGuard {
     function withdrawTreasury(uint256 amt) external onlyTreasury {
         require(amt <= treasuryAmtTotal, "amt exceeds treasury");
         treasuryAmtTotal -= amt;
-        payable(treasuryAddr).transfer(amt);
+        
+        // Safe transfer using call instead of transfer
+        (bool success, ) = payable(treasuryAddr).call{value: amt}("");
+        require(success, "!transfer");
+    }
+    
+    ////////////////////////////////////////////////////////////////////////////////
+    // Factory Fee Functions
+    ////////////////////////////////////////////////////////////////////////////////
+    
+    /**
+     * @dev Withdraw accumulated factory fees (only callable by factory)
+     */
+    function withdrawFactoryFees() external {
+        require(msg.sender == FACTORY, "!factory");
+        uint256 amount = factoryFeesAccrued;
+        require(amount > 0, "!fees");
+        
+        factoryFeesAccrued = 0;
+        
+        // Safe transfer using call
+        (bool success, ) = payable(FACTORY).call{value: amount}("");
+        require(success, "!transfer");
+        
+        emit FactoryFeesWithdrawn(FACTORY, amount);
     }
 
     ////////////////////////////////////////////////////////////////////////////////
-    // Receive ETH (for adding liquidity or donations)
+    // Receive Native Token (for adding liquidity or donations)
     ////////////////////////////////////////////////////////////////////////////////
 
     receive() external payable {}
 }
-
