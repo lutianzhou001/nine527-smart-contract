@@ -19,6 +19,7 @@ contract nine527Factory {
     uint256 public constant CHAIN_XLAYER = 196;
     
     mapping(uint256 => uint256) public nativePriceUSDCents;
+    mapping(uint256 => uint256) public creationFee; // Chain-specific creation fees
     
     address[] public allTokens;
     mapping(address => address[]) public tokensByDeployer;
@@ -26,9 +27,7 @@ contract nine527Factory {
     mapping(bytes32 => bool) public usedSalts;
     
     address public feeRecipient;
-    uint256 public creationFee;
     uint256 public accumulatedFees;
-    bool public enforceVanity = true;
     
     event TokenCreated(address indexed tokenAddress, address indexed deployer, string name, string symbol, uint256 treasuryFeeBP, bytes32 salt, uint256 virtualNative);
     event TokenCreatedAndBought(address indexed tokenAddress, address indexed deployer, uint256 buyAmount, uint256 tokensReceived);
@@ -37,7 +36,22 @@ contract nine527Factory {
     
     constructor() {
         feeRecipient = msg.sender;
-        creationFee = 0.1 ether;
+        
+        // ETH-based chains: 0.01 ETH creation fee
+        creationFee[CHAIN_ETHEREUM] = 0.01 ether;
+        creationFee[CHAIN_ARBITRUM] = 0.01 ether;
+        creationFee[CHAIN_OPTIMISM] = 0.01 ether;
+        creationFee[CHAIN_BASE] = 0.01 ether;
+        creationFee[CHAIN_ZKSYNC] = 0.01 ether;
+        creationFee[CHAIN_LINEA] = 0.01 ether;
+        creationFee[CHAIN_SCROLL] = 0.01 ether;
+        // BNB Chain: 0.05 BNB creation fee
+        creationFee[CHAIN_BNB] = 0.05 ether;
+        // Polygon: 10 POL creation fee
+        creationFee[CHAIN_POLYGON] = 10 ether;
+        // X Layer: 0.2 OKB creation fee
+        creationFee[CHAIN_XLAYER] = 0.2 ether;
+        
         // ETH-based chains ($3,000)
         nativePriceUSDCents[CHAIN_ETHEREUM] = 300000;
         nativePriceUSDCents[CHAIN_ARBITRUM] = 300000;
@@ -60,33 +74,177 @@ contract nine527Factory {
         return (TARGET_USD_CENTS * 1e18) / priceUSDCents;
     }
     
+    function getCreationFee() public view returns (uint256) {
+        uint256 fee = creationFee[block.chainid];
+        if (fee == 0) fee = 0.01 ether; // Default to 0.01 for unknown chains
+        return fee;
+    }
+    
+    // ============ CREATE2 Vanity Address Functions ============
+    
+    /// @notice Get the init code hash for mining vanity addresses
+    /// @param name_ Token name
+    /// @param symbol_ Token symbol
+    /// @param treasuryFeeBP_ Treasury fee in basis points (0-300)
+    /// @param deployer_ The deployer address (will be token's deployer/treasury)
+    /// @return The keccak256 hash of the init code
+    function getInitCodeHash(
+        string calldata name_,
+        string calldata symbol_,
+        uint256 treasuryFeeBP_,
+        address deployer_
+    ) public view returns (bytes32) {
+        uint256 virtualNative = getVirtualNativeForChain();
+        bytes memory initCode = abi.encodePacked(
+            type(nine527).creationCode,
+            abi.encode(name_, symbol_, treasuryFeeBP_, deployer_, virtualNative)
+        );
+        return keccak256(initCode);
+    }
+    
+    /// @notice Predict the address that will be deployed with CREATE2
+    /// @param name_ Token name
+    /// @param symbol_ Token symbol
+    /// @param treasuryFeeBP_ Treasury fee in basis points
+    /// @param deployer_ The deployer address
+    /// @param salt_ The salt for CREATE2
+    /// @return predicted The predicted address
+    /// @return isVanity Whether the address ends with 9527
+    function predictAddress(
+        string calldata name_,
+        string calldata symbol_,
+        uint256 treasuryFeeBP_,
+        address deployer_,
+        bytes32 salt_
+    ) public view returns (address predicted, bool isVanity) {
+        bytes32 initCodeHash = getInitCodeHash(name_, symbol_, treasuryFeeBP_, deployer_);
+        predicted = address(uint160(uint256(keccak256(abi.encodePacked(
+            bytes1(0xff),
+            address(this),
+            salt_,
+            initCodeHash
+        )))));
+        isVanity = _endsWithNine527(predicted);
+        return (predicted, isVanity);
+    }
+    
+    /// @notice Check if an address ends with 9527 (hex)
+    function _endsWithNine527(address addr) internal pure returns (bool) {
+        // 9527 in hex = 0x9527, check last 2 bytes
+        return (uint160(addr) & 0xFFFF) == 0x9527;
+    }
+    
+    /// @notice Create token with CREATE2 for vanity address
+    /// @param name_ Token name
+    /// @param symbol_ Token symbol
+    /// @param treasuryFeeBP_ Treasury fee in basis points (0-300)
+    /// @param salt_ Salt for CREATE2 (mined by frontend)
+    /// @return tokenAddress The deployed token address
+    function createToken(
+        string calldata name_,
+        string calldata symbol_,
+        uint256 treasuryFeeBP_,
+        bytes32 salt_
+    ) external payable returns (address tokenAddress) {
+        uint256 fee = getCreationFee();
+        require(msg.value >= fee, "!fee");
+        require(!usedSalts[salt_], "!salt");
+        
+        uint256 virtualNative = getVirtualNativeForChain();
+        
+        // Deploy with CREATE2
+        nine527 newToken = new nine527{salt: salt_}(
+            name_,
+            symbol_,
+            treasuryFeeBP_,
+            msg.sender,
+            virtualNative
+        );
+        tokenAddress = address(newToken);
+        
+        usedSalts[salt_] = true;
+        _trackAndCollectFee(tokenAddress, msg.sender, name_, symbol_, treasuryFeeBP_, salt_, virtualNative, fee);
+        return tokenAddress;
+    }
+    
+    /// @notice Create token with CREATE2 and buy tokens in one transaction
+    /// @param name_ Token name
+    /// @param symbol_ Token symbol
+    /// @param treasuryFeeBP_ Treasury fee in basis points (0-300)
+    /// @param salt_ Salt for CREATE2 (mined by frontend)
+    /// @param minTokenAmt_ Minimum tokens to receive (slippage protection)
+    /// @return tokenAddress The deployed token address
+    /// @return tokensReceived Amount of tokens received
+    function createTokenAndBuy(
+        string calldata name_,
+        string calldata symbol_,
+        uint256 treasuryFeeBP_,
+        bytes32 salt_,
+        uint256 minTokenAmt_
+    ) external payable returns (address tokenAddress, uint256 tokensReceived) {
+        uint256 fee = getCreationFee();
+        require(msg.value > fee, "!fee+buy");
+        require(!usedSalts[salt_], "!salt");
+        
+        uint256 virtualNative = getVirtualNativeForChain();
+        
+        // Deploy with CREATE2
+        nine527 newToken = new nine527{salt: salt_}(
+            name_,
+            symbol_,
+            treasuryFeeBP_,
+            msg.sender,
+            virtualNative
+        );
+        tokenAddress = address(newToken);
+        
+        usedSalts[salt_] = true;
+        _trackAndCollectFee(tokenAddress, msg.sender, name_, symbol_, treasuryFeeBP_, salt_, virtualNative, fee);
+        
+        // Buy tokens
+        uint256 buyAmount = msg.value - fee;
+        tokensReceived = newToken.estimateBuyReturn(buyAmount);
+        newToken.buyTokenFor{value: buyAmount}(msg.sender, minTokenAmt_, 0, true);
+        
+        emit TokenCreatedAndBought(tokenAddress, msg.sender, buyAmount, tokensReceived);
+        return (tokenAddress, tokensReceived);
+    }
+    
+    // ============ Simple (non-vanity) Functions ============
+    
     function createTokenSimple(string calldata name_, string calldata symbol_, uint256 treasuryFeeBP_) external payable returns (address tokenAddress) {
-        require(msg.value >= creationFee, "!fee");
+        uint256 fee = getCreationFee();
+        require(msg.value >= fee, "!fee");
+        
         uint256 virtualNative = getVirtualNativeForChain();
         nine527 newToken = new nine527(name_, symbol_, treasuryFeeBP_, msg.sender, virtualNative);
         tokenAddress = address(newToken);
-        _trackAndCollectFee(tokenAddress, msg.sender, name_, symbol_, treasuryFeeBP_, bytes32(0), virtualNative);
+        _trackAndCollectFee(tokenAddress, msg.sender, name_, symbol_, treasuryFeeBP_, bytes32(0), virtualNative, fee);
         return tokenAddress;
     }
     
     function createTokenSimpleAndBuy(string calldata name_, string calldata symbol_, uint256 treasuryFeeBP_, uint256 minTokenAmt_) external payable returns (address tokenAddress, uint256 tokensReceived) {
-        require(msg.value > creationFee, "!fee+buy");
+        uint256 fee = getCreationFee();
+        require(msg.value > fee, "!fee+buy");
+        
         uint256 virtualNative = getVirtualNativeForChain();
         nine527 newToken = new nine527(name_, symbol_, treasuryFeeBP_, msg.sender, virtualNative);
         tokenAddress = address(newToken);
-        _trackAndCollectFee(tokenAddress, msg.sender, name_, symbol_, treasuryFeeBP_, bytes32(0), virtualNative);
-        uint256 buyAmount = msg.value - creationFee;
+        _trackAndCollectFee(tokenAddress, msg.sender, name_, symbol_, treasuryFeeBP_, bytes32(0), virtualNative, fee);
+        uint256 buyAmount = msg.value - fee;
         tokensReceived = newToken.estimateBuyReturn(buyAmount);
         newToken.buyTokenFor{value: buyAmount}(msg.sender, minTokenAmt_, 0, true);
         emit TokenCreatedAndBought(tokenAddress, msg.sender, buyAmount, tokensReceived);
         return (tokenAddress, tokensReceived);
     }
     
-    function _trackAndCollectFee(address token, address deployer, string calldata name_, string calldata symbol_, uint256 treasuryFeeBP_, bytes32 salt_, uint256 virtualNative_) internal {
+    // ============ Internal & View Functions ============
+    
+    function _trackAndCollectFee(address token, address deployer, string calldata name_, string calldata symbol_, uint256 treasuryFeeBP_, bytes32 salt_, uint256 virtualNative_, uint256 fee_) internal {
         allTokens.push(token);
         tokensByDeployer[deployer].push(token);
         isValidToken[token] = true;
-        if (creationFee > 0) accumulatedFees += creationFee;
+        if (fee_ > 0) accumulatedFees += fee_;
         emit TokenCreated(token, deployer, name_, symbol_, treasuryFeeBP_, salt_, virtualNative_);
     }
     
@@ -114,9 +272,10 @@ contract nine527Factory {
         }
     }
     
-    function setCreationFee(uint256 newFee) external { require(msg.sender == feeRecipient, "!auth"); creationFee = newFee; }
+    // ============ Admin Functions ============
+    
+    function setCreationFee(uint256 chainId_, uint256 newFee) external { require(msg.sender == feeRecipient, "!auth"); creationFee[chainId_] = newFee; }
     function setFeeRecipient(address newRecipient) external { require(msg.sender == feeRecipient && newRecipient != address(0), "!auth"); feeRecipient = newRecipient; }
-    function setEnforceVanity(bool enforce) external { require(msg.sender == feeRecipient, "!auth"); enforceVanity = enforce; }
     
     function setNativePrice(uint256 chainId_, uint256 priceUSDCents_) external {
         require(msg.sender == feeRecipient, "!auth");

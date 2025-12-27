@@ -148,13 +148,16 @@ contract nine527Test is Test {
         assertApproxEqRel(virtualNative, VIRTUAL_NATIVE, 0.01e18); // 1% tolerance
     }
     
-    function test_Factory_CreateTokenSimple() public {
+    function test_Factory_CreateToken() public {
         vm.deal(address(this), 1 ether);
         
-        address tokenAddr = factory.createTokenSimple{value: 0.1 ether}(
-            "Factory Token",
-            "FACT",
-            100
+        bytes32 salt = bytes32(uint256(12345));
+        
+        address tokenAddr = factory.createToken{value: 0.01 ether}(
+            "Test",
+            "TST",
+            100,
+            salt
         );
         
         assertTrue(tokenAddr != address(0));
@@ -162,17 +165,24 @@ contract nine527Test is Test {
         assertEq(factory.totalTokens(), 1);
         
         nine527 createdToken = nine527(payable(tokenAddr));
-        assertEq(createdToken.name(), "Factory Token");
+        assertEq(createdToken.name(), "Test");
         assertEq(createdToken.DEPLOYER(), address(this));
+        
+        // Verify the address matches prediction
+        (address predicted, ) = factory.predictAddress("Test", "TST", 100, address(this), salt);
+        assertEq(tokenAddr, predicted, "Address should match prediction");
     }
     
-    function test_Factory_CreateTokenSimpleAndBuy() public {
+    function test_Factory_CreateTokenAndBuy() public {
         vm.deal(address(this), 2 ether);
         
-        (address tokenAddr, uint256 tokensReceived) = factory.createTokenSimpleAndBuy{value: 1 ether}(
-            "Buy Token",
-            "BUY",
+        bytes32 salt = bytes32(uint256(67890));
+        
+        (address tokenAddr, uint256 tokensReceived) = factory.createTokenAndBuy{value: 1 ether}(
+            "Test",
+            "TST",
             100,
+            salt,
             1 // minTokenAmt
         );
         
@@ -181,26 +191,47 @@ contract nine527Test is Test {
         
         nine527 createdToken = nine527(payable(tokenAddr));
         assertEq(createdToken.balanceOf(address(this)), tokensReceived);
+        
+        // Verify the address matches prediction
+        (address predicted, ) = factory.predictAddress("Test", "TST", 100, address(this), salt);
+        assertEq(tokenAddr, predicted, "Address should match prediction");
+    }
+    
+    function test_Factory_CreateTokenSimple() public {
+        vm.deal(address(this), 1 ether);
+        
+        address tokenAddr = factory.createTokenSimple{value: 0.01 ether}(
+            "Simple Token",
+            "SIMP",
+            100
+        );
+        
+        assertTrue(tokenAddr != address(0));
+        assertTrue(factory.isValidToken(tokenAddr));
     }
     
     function test_Factory_AccumulatedFees() public {
         vm.deal(address(this), 1 ether);
         
-        factory.createTokenSimple{value: 0.1 ether}("Fee Test", "FEE", 100);
+        // Default fee for unknown chains is 0.01 ether
+        uint256 expectedFee = factory.getCreationFee();
+        factory.createTokenSimple{value: expectedFee}("Fee Test", "FEE", 100);
         
-        assertEq(factory.accumulatedFees(), 0.1 ether);
+        assertEq(factory.accumulatedFees(), expectedFee);
     }
     
     function test_Factory_WithdrawFees() public {
         vm.deal(address(this), 1 ether);
         
-        factory.createTokenSimple{value: 0.1 ether}("Fee Test", "FEE", 100);
+        // Default fee for unknown chains is 0.01 ether
+        uint256 expectedFee = factory.getCreationFee();
+        factory.createTokenSimple{value: expectedFee}("Fee Test", "FEE", 100);
         
         uint256 balanceBefore = address(this).balance;
         factory.withdrawFees();
         
         assertEq(factory.accumulatedFees(), 0);
-        assertEq(address(this).balance, balanceBefore + 0.1 ether);
+        assertEq(address(this).balance, balanceBefore + expectedFee);
     }
     
     function test_Factory_SetNativePrice() public {
@@ -221,6 +252,51 @@ contract nine527Test is Test {
         
         assertEq(factory.nativePriceUSDCents(888), 100000);
         assertEq(factory.nativePriceUSDCents(777), 200000);
+    }
+    
+    function test_Factory_GetInitCodeHash() public view {
+        bytes32 hash = factory.getInitCodeHash("Test", "TST", 100, address(this));
+        assertTrue(hash != bytes32(0), "Init code hash should not be zero");
+    }
+    
+    function test_Factory_PredictAddress() public view {
+        bytes32 salt = bytes32(uint256(1));
+        (address predicted, bool isVanity) = factory.predictAddress("Test", "TST", 100, address(this), salt);
+        assertTrue(predicted != address(0), "Predicted address should not be zero");
+        // isVanity depends on whether the predicted address ends with 9527
+        if (_endsWithNine527(predicted)) {
+            assertTrue(isVanity, "Should be marked as vanity");
+        } else {
+            assertFalse(isVanity, "Should not be marked as vanity");
+        }
+    }
+    
+    function test_Factory_PredictVanityAddress() public view {
+        // Test the prediction function correctly identifies vanity addresses
+        bytes32 salt = bytes32(uint256(12345));
+        (address predicted, bool isVanity) = factory.predictAddress("Test", "TST", 100, address(this), salt);
+        
+        assertTrue(predicted != address(0), "Should predict an address");
+        // isVanity should match our helper function
+        assertEq(isVanity, _endsWithNine527(predicted), "isVanity should match actual check");
+    }
+    
+    function test_Factory_SaltReuse() public {
+        vm.deal(address(this), 2 ether);
+        
+        bytes32 salt = bytes32(uint256(99999));
+        
+        // First creation should succeed
+        factory.createToken{value: 0.01 ether}("Token1", "TK1", 100, salt);
+        
+        // Same salt should fail (even with different params)
+        vm.expectRevert(bytes("!salt"));
+        factory.createToken{value: 0.01 ether}("Token2", "TK2", 100, salt);
+    }
+    
+    // Helper to check if address ends with 9527 (0x9527)
+    function _endsWithNine527(address addr) internal pure returns (bool) {
+        return (uint160(addr) & 0xFFFF) == 0x9527;
     }
 
     ////////////////////////////////////////////////////////////////////////////////
