@@ -34,8 +34,9 @@ contract nine527Factory {
     event FeesWithdrawn(address indexed recipient, uint256 amount);
     event NativePriceUpdated(uint256 indexed chainId, uint256 priceUSDCents);
     
-    constructor() {
-        feeRecipient = msg.sender;
+    constructor(address admin_) {
+        require(admin_ != address(0), "!admin");
+        feeRecipient = admin_;
         
         // ETH-based chains: 0.01 ETH creation fee
         creationFee[CHAIN_ETHEREUM] = 0.01 ether;

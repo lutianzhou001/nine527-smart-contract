@@ -19,21 +19,27 @@ import "../src/nine527Factory.sol";
 contract Deploynine527FactoryScript is Script {
     // EIP-2470 Singleton Factory address (same on all chains)
     address constant SINGLETON_FACTORY = 0xce0042B868300000d44A59004Da54A005ffdcf9f;
-    
+
     // Salt for deterministic deployment - using "9527" as salt
     bytes32 constant SALT = keccak256("nine527.factory.v1");
 
+    // Admin address - MUST be set before deployment
+    // This is the address that will control the factory (withdraw fees, set prices, etc.)
+    address constant ADMIN = 0x0000000000000000000000000000000000000000; // TODO: Set your admin address here!
+
     function run() external {
+        require(ADMIN != address(0), "Admin address not set! Update ADMIN constant before deployment.");
+
         // Check if Singleton Factory exists
         uint256 codeSize;
         assembly {
             codeSize := extcodesize(SINGLETON_FACTORY)
         }
-        
+
         require(codeSize > 0, "Singleton Factory not deployed! Deploy it first using deploy-singleton-bnb.sh");
 
-        // Calculate deterministic address
-        bytes memory initCode = type(nine527Factory).creationCode;
+        // Calculate deterministic address with admin parameter
+        bytes memory initCode = abi.encodePacked(type(nine527Factory).creationCode, abi.encode(ADMIN));
         bytes32 initCodeHash = keccak256(initCode);
         
         address predictedAddress = address(uint160(uint256(keccak256(abi.encodePacked(
@@ -48,6 +54,7 @@ contract Deploynine527FactoryScript is Script {
         console.log("==============================================");
         console.log("");
         console.log("Singleton Factory:", SINGLETON_FACTORY);
+        console.log("Admin:", ADMIN);
         console.log("Salt:", vm.toString(SALT));
         console.log("Predicted Address:", predictedAddress);
         console.log("");
@@ -88,9 +95,9 @@ contract Deploynine527FactoryScript is Script {
     }
 
     function getPredictedAddress() external pure returns (address) {
-        bytes memory initCode = type(nine527Factory).creationCode;
+        bytes memory initCode = abi.encodePacked(type(nine527Factory).creationCode, abi.encode(ADMIN));
         bytes32 initCodeHash = keccak256(initCode);
-        
+
         return address(uint160(uint256(keccak256(abi.encodePacked(
             bytes1(0xff),
             SINGLETON_FACTORY,
@@ -103,17 +110,25 @@ contract Deploynine527FactoryScript is Script {
 /**
  * @title Deploynine527FactoryDirect
  * @dev Direct deployment without Singleton Factory (for testing or single-chain deployments)
+ *
+ * Usage:
+ * ADMIN=0xYourAdminAddress forge script script/DeployNine527Factory.s.sol:Deploynine527FactoryDirectScript \
+ *   --rpc-url <RPC_URL> --private-key <PRIVATE_KEY> --broadcast
  */
 contract Deploynine527FactoryDirectScript is Script {
     function run() external returns (address) {
+        address admin = vm.envAddress("ADMIN");
+        require(admin != address(0), "ADMIN env var not set!");
+
         vm.startBroadcast();
-        
-        nine527Factory factory = new nine527Factory();
-        
+
+        nine527Factory factory = new nine527Factory(admin);
+
         vm.stopBroadcast();
 
         console.log("nine527Factory deployed at:", address(factory));
-        
+        console.log("Admin:", admin);
+
         return address(factory);
     }
 }

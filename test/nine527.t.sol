@@ -13,6 +13,7 @@ contract nine527Test is Test {
     address public deployer = address(this);
     address public alice = address(0xA11CE);
     address public bob = address(0xB0B);
+    address public admin = address(0xAD1111);
     
     // USD-equivalent virtual native (~$2,600 worth at $3,000/ETH)
     // TARGET_USD_CENTS = 260000, ETH price = 300000 cents
@@ -21,19 +22,20 @@ contract nine527Test is Test {
     uint256 constant INITIAL_TOKEN_RESERVE = 1000000000 * 1e18; // 1B tokens
     
     function setUp() public {
-        // Deploy factory first
-        factory = new nine527Factory();
-        
+        // Deploy factory with admin address (for EIP-2470 compatibility)
+        factory = new nine527Factory(admin);
+
         // Deploy token with custom name, symbol, 0% treasury fee, and virtual native
         // address(0) means use msg.sender as deployer
         token = new nine527("Test Token", "TEST", 0, address(0), VIRTUAL_NATIVE);
-        
+
         // Deploy another token with 3% treasury fee for treasury tests
         tokenWithTreasury = new nine527("Treasury Token", "TRES", 300, address(0), VIRTUAL_NATIVE); // 300 BP = 3%
-        
+
         // Fund test accounts
         vm.deal(alice, 100 ether);
         vm.deal(bob, 100 ether);
+        vm.deal(admin, 100 ether);
     }
 
     ////////////////////////////////////////////////////////////////////////////////
@@ -139,7 +141,17 @@ contract nine527Test is Test {
     ////////////////////////////////////////////////////////////////////////////////
     // Factory Tests
     ////////////////////////////////////////////////////////////////////////////////
-    
+
+    function test_Factory_Deployment() public view {
+        // Verify admin is set as feeRecipient
+        assertEq(factory.feeRecipient(), admin);
+    }
+
+    function test_Factory_Deployment_RevertOnZeroAdmin() public {
+        vm.expectRevert(bytes("!admin"));
+        new nine527Factory(address(0));
+    }
+
     function test_Factory_GetVirtualNativeForChain() public view {
         // On mainnet fork or localhost (chainid 31337), should return ~0.867 ETH
         uint256 virtualNative = factory.getVirtualNativeForChain();
@@ -147,37 +159,37 @@ contract nine527Test is Test {
         // Should be approximately 0.867 ETH for ETH-priced chains
         assertApproxEqRel(virtualNative, VIRTUAL_NATIVE, 0.01e18); // 1% tolerance
     }
-    
+
     function test_Factory_CreateToken() public {
         vm.deal(address(this), 1 ether);
-        
+
         bytes32 salt = bytes32(uint256(12345));
-        
+
         address tokenAddr = factory.createToken{value: 0.01 ether}(
             "Test",
             "TST",
             100,
             salt
         );
-        
+
         assertTrue(tokenAddr != address(0));
         assertTrue(factory.isValidToken(tokenAddr));
         assertEq(factory.totalTokens(), 1);
-        
+
         nine527 createdToken = nine527(payable(tokenAddr));
         assertEq(createdToken.name(), "Test");
         assertEq(createdToken.DEPLOYER(), address(this));
-        
+
         // Verify the address matches prediction
         (address predicted, ) = factory.predictAddress("Test", "TST", 100, address(this), salt);
         assertEq(tokenAddr, predicted, "Address should match prediction");
     }
-    
+
     function test_Factory_CreateTokenAndBuy() public {
         vm.deal(address(this), 2 ether);
-        
+
         bytes32 salt = bytes32(uint256(67890));
-        
+
         (address tokenAddr, uint256 tokensReceived) = factory.createTokenAndBuy{value: 1 ether}(
             "Test",
             "TST",
@@ -185,80 +197,245 @@ contract nine527Test is Test {
             salt,
             1 // minTokenAmt
         );
-        
+
         assertTrue(tokenAddr != address(0));
         assertGt(tokensReceived, 0);
-        
+
         nine527 createdToken = nine527(payable(tokenAddr));
         assertEq(createdToken.balanceOf(address(this)), tokensReceived);
-        
+
         // Verify the address matches prediction
         (address predicted, ) = factory.predictAddress("Test", "TST", 100, address(this), salt);
         assertEq(tokenAddr, predicted, "Address should match prediction");
     }
-    
+
     function test_Factory_CreateTokenSimple() public {
         vm.deal(address(this), 1 ether);
-        
+
         address tokenAddr = factory.createTokenSimple{value: 0.01 ether}(
             "Simple Token",
             "SIMP",
             100
         );
-        
+
         assertTrue(tokenAddr != address(0));
         assertTrue(factory.isValidToken(tokenAddr));
     }
-    
+
     function test_Factory_AccumulatedFees() public {
         vm.deal(address(this), 1 ether);
-        
+
         // Default fee for unknown chains is 0.01 ether
         uint256 expectedFee = factory.getCreationFee();
         factory.createTokenSimple{value: expectedFee}("Fee Test", "FEE", 100);
-        
+
         assertEq(factory.accumulatedFees(), expectedFee);
     }
-    
+
     function test_Factory_WithdrawFees() public {
         vm.deal(address(this), 1 ether);
-        
+
         // Default fee for unknown chains is 0.01 ether
         uint256 expectedFee = factory.getCreationFee();
         factory.createTokenSimple{value: expectedFee}("Fee Test", "FEE", 100);
-        
-        uint256 balanceBefore = address(this).balance;
+
+        uint256 adminBalanceBefore = admin.balance;
+
+        // Only admin can withdraw
+        vm.prank(admin);
         factory.withdrawFees();
-        
+
         assertEq(factory.accumulatedFees(), 0);
-        assertEq(address(this).balance, balanceBefore + expectedFee);
+        assertEq(admin.balance, adminBalanceBefore + expectedFee);
     }
-    
+
+    function test_Factory_WithdrawFees_RevertNonAdmin() public {
+        vm.deal(address(this), 1 ether);
+
+        uint256 expectedFee = factory.getCreationFee();
+        factory.createTokenSimple{value: expectedFee}("Fee Test", "FEE", 100);
+
+        // Non-admin should fail
+        vm.prank(alice);
+        vm.expectRevert(bytes("!auth"));
+        factory.withdrawFees();
+    }
+
+    function test_Factory_WithdrawFees_RevertNoFees() public {
+        // No fees accumulated, should fail
+        vm.prank(admin);
+        vm.expectRevert(bytes("!fees"));
+        factory.withdrawFees();
+    }
+
+    function test_Factory_WithdrawFees_MultipleTimes() public {
+        vm.deal(address(this), 10 ether);
+
+        uint256 expectedFee = factory.getCreationFee();
+
+        // Create first token
+        factory.createTokenSimple{value: expectedFee}("Token1", "TK1", 100);
+        assertEq(factory.accumulatedFees(), expectedFee);
+
+        // Admin withdraws first batch
+        uint256 adminBalanceBefore = admin.balance;
+        vm.prank(admin);
+        factory.withdrawFees();
+        assertEq(admin.balance, adminBalanceBefore + expectedFee);
+        assertEq(factory.accumulatedFees(), 0);
+
+        // Create second token
+        factory.createTokenSimple{value: expectedFee}("Token2", "TK2", 100);
+        assertEq(factory.accumulatedFees(), expectedFee);
+
+        // Admin withdraws second batch
+        adminBalanceBefore = admin.balance;
+        vm.prank(admin);
+        factory.withdrawFees();
+        assertEq(admin.balance, adminBalanceBefore + expectedFee);
+        assertEq(factory.accumulatedFees(), 0);
+    }
+
+    function test_Factory_WithdrawFees_AfterMultipleCreations() public {
+        vm.deal(address(this), 10 ether);
+        vm.deal(alice, 10 ether);
+        vm.deal(bob, 10 ether);
+
+        uint256 expectedFee = factory.getCreationFee();
+
+        // Multiple users create tokens
+        factory.createTokenSimple{value: expectedFee}("Token1", "TK1", 100);
+
+        vm.prank(alice);
+        factory.createTokenSimple{value: expectedFee}("Token2", "TK2", 100);
+
+        vm.prank(bob);
+        factory.createTokenSimple{value: expectedFee}("Token3", "TK3", 100);
+
+        // Total fees should be 3x
+        assertEq(factory.accumulatedFees(), expectedFee * 3);
+
+        // Admin withdraws all
+        uint256 adminBalanceBefore = admin.balance;
+        vm.prank(admin);
+        factory.withdrawFees();
+
+        assertEq(factory.accumulatedFees(), 0);
+        assertEq(admin.balance, adminBalanceBefore + expectedFee * 3);
+    }
+
+    function test_Factory_SetFeeRecipient() public {
+        address newRecipient = address(0x123456);
+
+        vm.prank(admin);
+        factory.setFeeRecipient(newRecipient);
+
+        assertEq(factory.feeRecipient(), newRecipient);
+    }
+
+    function test_Factory_SetFeeRecipient_RevertNonAdmin() public {
+        vm.prank(alice);
+        vm.expectRevert(bytes("!auth"));
+        factory.setFeeRecipient(alice);
+    }
+
+    function test_Factory_SetFeeRecipient_RevertZeroAddress() public {
+        vm.prank(admin);
+        vm.expectRevert(bytes("!auth"));
+        factory.setFeeRecipient(address(0));
+    }
+
+    function test_Factory_SetCreationFee() public {
+        uint256 newFee = 0.05 ether;
+        uint256 testChainId = 999;
+
+        vm.prank(admin);
+        factory.setCreationFee(testChainId, newFee);
+
+        assertEq(factory.creationFee(testChainId), newFee);
+    }
+
+    function test_Factory_SetCreationFee_RevertNonAdmin() public {
+        vm.prank(alice);
+        vm.expectRevert(bytes("!auth"));
+        factory.setCreationFee(999, 0.05 ether);
+    }
+
     function test_Factory_SetNativePrice() public {
+        vm.prank(admin);
         factory.setNativePrice(999, 50000); // Custom chain at $500
         assertEq(factory.nativePriceUSDCents(999), 50000);
     }
-    
+
+    function test_Factory_SetNativePrice_RevertNonAdmin() public {
+        vm.prank(alice);
+        vm.expectRevert(bytes("!auth"));
+        factory.setNativePrice(999, 50000);
+    }
+
+    function test_Factory_SetNativePrice_RevertZeroPrice() public {
+        vm.prank(admin);
+        vm.expectRevert(bytes("!price"));
+        factory.setNativePrice(999, 0);
+    }
+
     function test_Factory_SetNativePricesBatch() public {
         uint256[] memory chainIds = new uint256[](2);
         uint256[] memory prices = new uint256[](2);
-        
+
         chainIds[0] = 888;
         chainIds[1] = 777;
         prices[0] = 100000; // $1,000
         prices[1] = 200000; // $2,000
-        
+
+        vm.prank(admin);
         factory.setNativePricesBatch(chainIds, prices);
-        
+
         assertEq(factory.nativePriceUSDCents(888), 100000);
         assertEq(factory.nativePriceUSDCents(777), 200000);
     }
-    
+
+    function test_Factory_SetNativePricesBatch_RevertNonAdmin() public {
+        uint256[] memory chainIds = new uint256[](1);
+        uint256[] memory prices = new uint256[](1);
+        chainIds[0] = 888;
+        prices[0] = 100000;
+
+        vm.prank(alice);
+        vm.expectRevert(bytes("!auth"));
+        factory.setNativePricesBatch(chainIds, prices);
+    }
+
+    function test_Factory_SetNativePricesBatch_RevertLengthMismatch() public {
+        uint256[] memory chainIds = new uint256[](2);
+        uint256[] memory prices = new uint256[](1);
+        chainIds[0] = 888;
+        chainIds[1] = 777;
+        prices[0] = 100000;
+
+        vm.prank(admin);
+        vm.expectRevert(bytes("!length"));
+        factory.setNativePricesBatch(chainIds, prices);
+    }
+
+    function test_Factory_SetNativePricesBatch_RevertZeroPrice() public {
+        uint256[] memory chainIds = new uint256[](2);
+        uint256[] memory prices = new uint256[](2);
+        chainIds[0] = 888;
+        chainIds[1] = 777;
+        prices[0] = 100000;
+        prices[1] = 0; // Invalid
+
+        vm.prank(admin);
+        vm.expectRevert(bytes("!price"));
+        factory.setNativePricesBatch(chainIds, prices);
+    }
+
     function test_Factory_GetInitCodeHash() public view {
         bytes32 hash = factory.getInitCodeHash("Test", "TST", 100, address(this));
         assertTrue(hash != bytes32(0), "Init code hash should not be zero");
     }
-    
+
     function test_Factory_PredictAddress() public view {
         bytes32 salt = bytes32(uint256(1));
         (address predicted, bool isVanity) = factory.predictAddress("Test", "TST", 100, address(this), salt);
@@ -270,30 +447,97 @@ contract nine527Test is Test {
             assertFalse(isVanity, "Should not be marked as vanity");
         }
     }
-    
+
     function test_Factory_PredictVanityAddress() public view {
         // Test the prediction function correctly identifies vanity addresses
         bytes32 salt = bytes32(uint256(12345));
         (address predicted, bool isVanity) = factory.predictAddress("Test", "TST", 100, address(this), salt);
-        
+
         assertTrue(predicted != address(0), "Should predict an address");
         // isVanity should match our helper function
         assertEq(isVanity, _endsWithNine527(predicted), "isVanity should match actual check");
     }
-    
+
     function test_Factory_SaltReuse() public {
         vm.deal(address(this), 2 ether);
-        
+
         bytes32 salt = bytes32(uint256(99999));
-        
+
         // First creation should succeed
         factory.createToken{value: 0.01 ether}("Token1", "TK1", 100, salt);
-        
+
         // Same salt should fail (even with different params)
         vm.expectRevert(bytes("!salt"));
         factory.createToken{value: 0.01 ether}("Token2", "TK2", 100, salt);
     }
-    
+
+    function test_Factory_ReceiveNative() public {
+        // Factory should accept native via receive()
+        uint256 sendAmount = 1 ether;
+        vm.deal(alice, sendAmount);
+
+        uint256 feesBefore = factory.accumulatedFees();
+
+        vm.prank(alice);
+        (bool success, ) = address(factory).call{value: sendAmount}("");
+        assertTrue(success, "Should accept native");
+
+        assertEq(factory.accumulatedFees(), feesBefore + sendAmount);
+    }
+
+    function test_Factory_WithdrawTokenFees() public {
+        vm.deal(address(this), 10 ether);
+
+        // Create a token with treasury fee via factory
+        bytes32 salt = bytes32(uint256(111222));
+        (address tokenAddr, ) = factory.createTokenAndBuy{value: 1 ether}(
+            "Treasury",
+            "TRES",
+            300, // 3% treasury fee
+            salt,
+            1
+        );
+
+        nine527 createdToken = nine527(payable(tokenAddr));
+
+        // Buy and sell to generate factory fees
+        vm.deal(alice, 100 ether);
+        vm.prank(alice, alice);
+        createdToken.buyToken{value: 10 ether}(1, 0);
+
+        uint256 aliceTokens = createdToken.balanceOf(alice);
+        vm.prank(alice, alice);
+        createdToken.sellToken(aliceTokens / 2, 1, 0);
+
+        // Check factory fees accrued on token
+        uint256 factoryFees = createdToken.factoryFeesAccrued();
+        assertGt(factoryFees, 0, "Should have factory fees");
+
+        // Admin can withdraw token fees
+        uint256 factoryBalanceBefore = address(factory).balance;
+        vm.prank(admin);
+        factory.withdrawTokenFees(tokenAddr);
+
+        // Factory should have received the fees
+        assertEq(address(factory).balance, factoryBalanceBefore + factoryFees);
+        assertEq(createdToken.factoryFeesAccrued(), 0);
+    }
+
+    function test_Factory_WithdrawTokenFees_RevertNonAdmin() public {
+        vm.deal(address(this), 1 ether);
+        address tokenAddr = factory.createTokenSimple{value: 0.01 ether}("Test", "TST", 100);
+
+        vm.prank(alice);
+        vm.expectRevert(bytes("!auth"));
+        factory.withdrawTokenFees(tokenAddr);
+    }
+
+    function test_Factory_WithdrawTokenFees_RevertInvalidToken() public {
+        vm.prank(admin);
+        vm.expectRevert(bytes("!token"));
+        factory.withdrawTokenFees(address(0x123));
+    }
+
     // Helper to check if address ends with 9527 (0x9527)
     function _endsWithNine527(address addr) internal pure returns (bool) {
         return (uint160(addr) & 0xFFFF) == 0x9527;

@@ -3,6 +3,13 @@
 # ============================================================================
 # nine527Factory Deployment Script for BNB Chain
 # Uses EIP-2470 Singleton Factory for deterministic addresses
+#
+# Usage:
+#   ./deploy-nine527-bnb.sh <network> <admin_address> [private_key]
+#
+# Examples:
+#   ./deploy-nine527-bnb.sh testnet 0xYourAdminAddress
+#   ./deploy-nine527-bnb.sh mainnet 0xYourAdminAddress 0xYourPrivateKey
 # ============================================================================
 
 set -e
@@ -29,7 +36,30 @@ echo -e "${NC}"
 
 # Parse arguments
 NETWORK="${1:-testnet}"
-PRIVATE_KEY="${2:-}"
+ADMIN_ADDRESS="${2:-}"
+PRIVATE_KEY="${3:-}"
+
+# Validate admin address
+if [ -z "$ADMIN_ADDRESS" ]; then
+    echo -e "${RED}Error: Admin address is required!${NC}"
+    echo ""
+    echo "Usage: ./deploy-nine527-bnb.sh <network> <admin_address> [private_key]"
+    echo ""
+    echo "Examples:"
+    echo "  ./deploy-nine527-bnb.sh testnet 0xYourAdminAddress"
+    echo "  ./deploy-nine527-bnb.sh mainnet 0xYourAdminAddress 0xYourPrivateKey"
+    echo ""
+    exit 1
+fi
+
+# Validate admin address format
+if [[ ! "$ADMIN_ADDRESS" =~ ^0x[a-fA-F0-9]{40}$ ]]; then
+    echo -e "${RED}Error: Invalid admin address format!${NC}"
+    echo "Address must be a valid Ethereum address (0x followed by 40 hex characters)"
+    exit 1
+fi
+
+echo -e "${GREEN}Admin Address: $ADMIN_ADDRESS${NC}"
 
 if [ "$NETWORK" == "mainnet" ]; then
     RPC_URL="$BNB_MAINNET_RPC"
@@ -71,37 +101,15 @@ fi
 echo -e "${GREEN}✓ Singleton Factory found at $SINGLETON_FACTORY${NC}"
 echo ""
 
-# Step 2: Calculate predicted address
-echo -e "${CYAN}Step 2: Calculating deterministic address...${NC}"
+# Step 2: Build contracts
+echo -e "${CYAN}Step 2: Building contracts...${NC}"
 
 # Get the script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
-# Build the contracts first
-echo "Building contracts..."
 forge build --quiet
-
-# Calculate predicted address using the script
-PREDICTED=$(forge script script/Deploynine527Factory.s.sol:Deploynine527FactoryScript \
-    --rpc-url $RPC_URL \
-    --sig "getPredictedAddress()(address)" 2>/dev/null | tail -1 || echo "")
-
-if [ -z "$PREDICTED" ]; then
-    echo -e "${YELLOW}Could not calculate predicted address, will deploy anyway...${NC}"
-else
-    echo -e "Predicted Address: ${GREEN}$PREDICTED${NC}"
-    
-    # Check if already deployed
-    EXISTING_CODE=$(cast code $PREDICTED --rpc-url $RPC_URL 2>/dev/null || echo "0x")
-    
-    if [ "$EXISTING_CODE" != "0x" ] && [ -n "$EXISTING_CODE" ]; then
-        echo -e "${GREEN}✓ nine527Factory already deployed at $PREDICTED${NC}"
-        echo ""
-        exit 0
-    fi
-fi
-
+echo -e "${GREEN}✓ Contracts built successfully${NC}"
 echo ""
 
 # Step 3: Deploy
@@ -109,10 +117,10 @@ if [ -z "$PRIVATE_KEY" ]; then
     echo -e "${YELLOW}No private key provided.${NC}"
     echo ""
     echo "To deploy nine527Factory, run:"
-    echo "  ./deploy-nine527-bnb.sh $NETWORK YOUR_PRIVATE_KEY"
+    echo "  ./deploy-nine527-bnb.sh $NETWORK $ADMIN_ADDRESS YOUR_PRIVATE_KEY"
     echo ""
     echo "Or deploy directly with forge:"
-    echo "  forge script script/Deploynine527Factory.s.sol:Deploynine527FactoryScript \\"
+    echo "  ADMIN=$ADMIN_ADDRESS forge script script/DeployNine527Factory.s.sol:Deploynine527FactoryDirectScript \\"
     echo "    --rpc-url $RPC_URL \\"
     echo "    --private-key YOUR_PRIVATE_KEY \\"
     echo "    --broadcast"
@@ -121,8 +129,9 @@ if [ -z "$PRIVATE_KEY" ]; then
 fi
 
 echo -e "${CYAN}Step 3: Deploying nine527Factory...${NC}"
+echo -e "Admin: ${GREEN}$ADMIN_ADDRESS${NC}"
 
-forge script script/Deploynine527Factory.s.sol:Deploynine527FactoryScript \
+ADMIN=$ADMIN_ADDRESS forge script script/DeployNine527Factory.s.sol:Deploynine527FactoryDirectScript \
     --rpc-url $RPC_URL \
     --private-key $PRIVATE_KEY \
     --broadcast
@@ -134,21 +143,13 @@ echo "   ✓ DEPLOYMENT COMPLETE!"
 echo "============================================================"
 echo -e "${NC}"
 
-# Verify deployment
-if [ -n "$PREDICTED" ]; then
-    echo "Verifying deployment..."
-    sleep 5
-    
-    FINAL_CODE=$(cast code $PREDICTED --rpc-url $RPC_URL 2>/dev/null || echo "0x")
-    
-    if [ "$FINAL_CODE" != "0x" ] && [ -n "$FINAL_CODE" ]; then
-        echo -e "${GREEN}✓ nine527Factory verified at $PREDICTED${NC}"
-    fi
-fi
-
 echo ""
 echo "Next steps:"
-echo "1. Update frontend/src/config/wagmi.ts with the factory address"
-echo "2. Deploy tokens using the factory!"
+echo "1. Copy the deployed factory address from the output above"
+echo "2. Update frontend/src/config/wagmi.ts with the factory address"
+echo "3. The admin ($ADMIN_ADDRESS) can now:"
+echo "   - Withdraw creation fees: factory.withdrawFees()"
+echo "   - Update native prices: factory.setNativePrice(chainId, priceUSDCents)"
+echo "   - Change fee recipient: factory.setFeeRecipient(newAddress)"
 echo ""
 
