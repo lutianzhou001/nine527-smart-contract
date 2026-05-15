@@ -30,6 +30,12 @@ import "./nine527.sol";
  */
 contract nine527Factory {
 
+    struct TokenSummary {
+        address tokenAddress;
+        string  name;
+        string  symbol;
+    }
+
     // ── Registry ──────────────────────────────────────────────────────────────
     address[] public allTokens;                         // ordered by creation time
     mapping(address => address[]) public tokensByDeployer;
@@ -235,6 +241,41 @@ contract nine527Factory {
     /** @dev Total number of tokens deployed through this factory. */
     function totalTokens() external view returns (uint256) {
         return allTokens.length;
+    }
+
+    /** @dev Return every token deployed through this factory with name and symbol, in creation order. */
+    function getAllTokens() external view returns (TokenSummary[] memory summaries) {
+        uint256 total = allTokens.length;
+        summaries = new TokenSummary[](total);
+        for (uint256 i = 0; i < total; i++) {
+            nine527 t = nine527(payable(allTokens[i]));
+            summaries[i] = TokenSummary(allTokens[i], t.name(), t.symbol());
+        }
+    }
+
+    /**
+     * @dev Return a slice of the token list with name and symbol for pagination.
+     *
+     * @param offset  Zero-based index of the first token to return.
+     * @param limit   Maximum number of tokens to return.
+     *
+     * Returns tokens[offset .. offset+limit], capped at the end of the array.
+     * Reverts if `offset` is beyond the total count so callers detect the boundary.
+     */
+    function getTokensPaginated(uint256 offset, uint256 limit) external view returns (TokenSummary[] memory page, uint256 total) {
+        total = allTokens.length;
+        require(offset < total || total == 0, "offset out of range");
+
+        uint256 end = offset + limit;
+        if (end > total) end = total;
+        uint256 size = end - offset;
+
+        page = new TokenSummary[](size);
+        for (uint256 i = 0; i < size; i++) {
+            address addr = allTokens[offset + i];
+            nine527 t = nine527(payable(addr));
+            page[i] = TokenSummary(addr, t.name(), t.symbol());
+        }
     }
 
     /** @dev All tokens deployed by a specific address, in creation order. */

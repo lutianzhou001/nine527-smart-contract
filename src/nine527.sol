@@ -75,11 +75,9 @@ contract nine527 is ERC20, ReentrancyGuard {
 
     // Bit-field: controls which checks apply to buyers and sellers.
     //   bit 0 (level & 1 == 1): extcodesize — rejects callers that are contracts
-    //   bit 1 (level >= 2):      tx.origin   — rejects calls via another contract
-    //   level 3 = both checks active (most restrictive)
-    // Note: extcodesize is bypassable in a constructor; tx.origin is the stronger guard.
-    uint256 public constant CONTRACT_CHECK_BUY_LEVEL  = 3;
-    uint256 public constant CONTRACT_CHECK_SELL_LEVEL = 3;
+    //   level 0 = no checks (ERC-4337 / smart contract wallet compatible)
+    uint256 public constant CONTRACT_CHECK_BUY_LEVEL  = 0;
+    uint256 public constant CONTRACT_CHECK_SELL_LEVEL = 0;
 
     ////////////////////////////////////////////////////////////////////////////
     // State Variables
@@ -290,12 +288,7 @@ contract nine527 is ERC20, ReentrancyGuard {
     function buyToken(uint256 minTokenAmt, uint256 expireTimestamp) external payable nonReentrant {
         address user = msg.sender;
 
-        // Anti-bot: level 3 applies both guards.
-        // extcodesize rejects contracts (bit 0); tx.origin rejects calls forwarded
-        // through intermediary contracts (bit 1).  Both can be circumvented in edge
-        // cases (constructor calls, flash-loan wrappers), so they're defence-in-depth.
         if (CONTRACT_CHECK_BUY_LEVEL % 2 == 1) require(!_isContract(user), "!human");
-        if (CONTRACT_CHECK_BUY_LEVEL >= 2)      require(user == tx.origin,   "!human");
 
         require(MARKET_OPEN_STAGE > 0, "!market");
         require(msg.value > 0,         "!eth");
@@ -353,7 +346,6 @@ contract nine527 is ERC20, ReentrancyGuard {
         address payable user = payable(msg.sender);
 
         if (CONTRACT_CHECK_SELL_LEVEL % 2 == 1) require(!_isContract(user), "!human");
-        if (CONTRACT_CHECK_SELL_LEVEL >= 2)      require(user == tx.origin,   "!human");
 
         require(tokenAmt > 0,  "!token");
         require(minEthAmt > 0, "!minEth");
@@ -474,9 +466,7 @@ contract nine527 is ERC20, ReentrancyGuard {
 
     /**
      * @dev Returns true if `account` has deployed bytecode (i.e. is a contract).
-     * Note: returns false during the target contract's own constructor, so a
-     * malicious contract can bypass this check by calling buyToken from its
-     * constructor.  Paired with tx.origin for stronger coverage.
+     * Note: returns false during the target contract's own constructor.
      */
     function _isContract(address account) internal view returns (bool) {
         return account.code.length > 0;
