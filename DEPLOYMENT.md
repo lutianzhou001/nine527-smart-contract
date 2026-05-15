@@ -93,14 +93,51 @@ Following [EIP-2470](https://eips.ethereum.org/EIPS/eip-2470):
    cast code 0xce0042B868300000d44A59004Da54A005ffdcf9f --rpc-url https://bsc-dataseed.binance.org/
    ```
 
+## Quick Start (X Layer / OKX L2)
+
+X Layer is OKX's zkEVM Layer 2. The EIP-2470 Singleton Factory is **already deployed** on X Layer mainnet.
+
+### Deploy to X Layer Mainnet
+
+```bash
+./script/deploy-nine527-xlayer.sh mainnet YOUR_PRIVATE_KEY [OKLINK_API_KEY]
+```
+
+### Deploy to X Layer Testnet
+
+```bash
+./script/deploy-nine527-xlayer.sh testnet YOUR_PRIVATE_KEY
+```
+
+### Open-source (verify) contracts on OKLink
+
+1. Get an API key from https://www.oklink.com/account/my-api
+2. Verify nine527Factory:
+
+```bash
+forge verify-contract \
+  --chain-id 196 \
+  --verifier etherscan \
+  --verifier-url "https://www.oklink.com/api/v5/explorer/contract/verify-source-code-plugin/XLAYER" \
+  --etherscan-api-key YOUR_OKLINK_API_KEY \
+  --compiler-version 0.8.20 \
+  --num-of-optimizations 1 \
+  YOUR_FACTORY_ADDRESS \
+  src/nine527Factory.sol:nine527Factory
+```
+
+---
+
 ## Supported Networks
 
-| Network | Chain ID | RPC URL |
-|---------|----------|---------|
-| BNB Mainnet | 56 | https://bsc-dataseed.binance.org/ |
-| BNB Testnet | 97 | https://data-seed-prebsc-1-s1.binance.org:8545/ |
-| Ethereum Mainnet | 1 | https://eth.llamarpc.com |
-| Sepolia Testnet | 11155111 | https://rpc.sepolia.org |
+| Network | Chain ID | RPC URL | Native Token |
+|---------|----------|---------|--------------|
+| X Layer Mainnet | 196 | https://rpc.xlayer.tech | OKB |
+| X Layer Testnet | 195 | https://testrpc.xlayer.tech | OKB |
+| BNB Mainnet | 56 | https://bsc-dataseed.binance.org/ | BNB |
+| BNB Testnet | 97 | https://data-seed-prebsc-1-s1.binance.org:8545/ | BNB |
+| Ethereum Mainnet | 1 | https://eth.llamarpc.com | ETH |
+| Sepolia Testnet | 11155111 | https://rpc.sepolia.org | ETH |
 
 ## Contract Addresses
 

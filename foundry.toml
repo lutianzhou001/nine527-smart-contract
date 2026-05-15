@@ -12,3 +12,13 @@ optimizer_runs = 1  # Low runs = smaller bytecode, higher gas per call
 via_ir = true       # Use new IR pipeline for better optimization
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+
+[rpc_endpoints]
+xlayer_mainnet = "https://rpc.xlayer.tech"
+xlayer_testnet = "https://testrpc.xlayer.tech"
+bnb_mainnet    = "https://bsc-dataseed.binance.org/"
+bnb_testnet    = "https://data-seed-prebsc-1-s1.binance.org:8545/"
+
+[etherscan]
+xlayer_mainnet = { key = "${OKLINK_API_KEY}", chain = 196, url = "https://www.oklink.com/api/v5/explorer/contract/verify-source-code-plugin/XLAYER" }
+xlayer_testnet = { key = "${OKLINK_API_KEY}", chain = 195, url = "https://www.oklink.com/api/v5/explorer/contract/verify-source-code-plugin/XLAYER_TESTNET" }

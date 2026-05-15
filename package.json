@@ -1,0 +1,16 @@
+{
+  "name": "nine527-smart-contract",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "verify:factory": "OKLINK_API_KEY=nokeyneeded forge verify-contract 0x5AeA8C284a3e162C04e926fa8Db69d726754f1Fd src/nine527Factory.sol:nine527Factory --chain 196 --compiler-version 0.8.35+commit.47b9dedd --verifier oklink --verifier-url https://www.oklink.com/api/v5/explorer/contract/verify-source-code-plugin/XLAYER --etherscan-api-key nokeyneeded --num-of-optimizations 1 --via-ir --evm-version osaka"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@okxweb3/hardhat-explorer-verify": "^1.6.5",
+    "hardhat": "^2.22.0"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "5.5.0"
+  }
+}
