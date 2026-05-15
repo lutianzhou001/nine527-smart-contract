@@ -12,8 +12,8 @@ contract nine527Test is Test {
     address public alice = address(0xA11CE);
     address public bob = address(0xB0B);
     
-    uint256 constant INITIAL_VIRTUAL_ETH = 10 * 1e18;            // 10 ETH
-    uint256 constant INITIAL_TOKEN_RESERVE = 100000000 * 1e18;  // 100M tokens
+    uint256 constant INITIAL_VIRTUAL_ETH = 21 * 1e18;              // 21 OKB
+    uint256 constant INITIAL_TOKEN_RESERVE = 1000000000 * 1e18;  // 1B tokens
     
     function setUp() public {
         // Deploy token with custom name, symbol, and 0% treasury fee
@@ -108,7 +108,7 @@ contract nine527Test is Test {
         // ETH reserve should be the virtual amount (no real ETH yet)
         assertEq(token.getEthReserve(), INITIAL_VIRTUAL_ETH);
         
-        // Initial price: 10 ETH / 100M tokens = 0.0000001 ETH per token
+        // Initial price: 21 OKB / 1B tokens = 0.000000021 OKB per token
         uint256 expectedPrice = (INITIAL_VIRTUAL_ETH * 1e18) / INITIAL_TOKEN_RESERVE;
         assertEq(token.getTokenPrice(), expectedPrice);
     }

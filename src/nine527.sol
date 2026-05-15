@@ -6,89 +6,129 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title nine527
- * @dev A customizable token with deep virtual floor liquidity
- * 
- * Anyone can deploy their own token with:
- * - Custom name and symbol
- * - Configurable treasury fee (0-3%)
- * 
- * Virtual Liquidity Mechanism:
- * - The contract starts with VIRTUAL ETH and TOKEN reserves
- * - No actual ETH is required at deployment - it's "virtual"
- * - As users buy, real ETH flows in and mixes with virtual reserves
- * - The constant product formula (x * y = k) ensures price discovery
+ * @dev Meme token with a built-in single-sided AMM backed by virtual liquidity.
+ *
+ * ── Virtual Liquidity ──────────────────────────────────────────────────────────
+ * The AMM starts with INITIAL_VIRTUAL_ETH (10 OKB) and INITIAL_TOKEN_RESERVE
+ * (1 B tokens) already "in the pool" without any real ETH being deposited.
+ * These virtual amounts are never stored — they are constants added into every
+ * reserve calculation at runtime.  Real ETH flows in as users buy; the virtual
+ * ETH ensures the price curve is well-behaved from the very first trade and
+ * sets the launch price to 10 OKB / 1,000,000,000 tokens = 1e-8 OKB/token.
+ *
+ * ── Constant Product AMM (x · y = k) ──────────────────────────────────────────
+ * Both buy and sell use the standard x·y = k formula, with integer rounding
+ * applied via the "+reserve/2" trick (round to nearest instead of truncating).
+ * This prevents the seller/buyer from being systematically shortchanged by 1 wei.
+ *
+ * ── Treasury Fee ──────────────────────────────────────────────────────────────
+ * Sell fees accumulate inside the contract as real ETH (tracked by
+ * `treasuryAmtTotal`) but are subtracted from the ETH reserve so they don't
+ * inflate the apparent liquidity pool.  The treasury must call `withdrawTreasury`
+ * to actually extract them.
+ *
+ * ── AutoBoost ─────────────────────────────────────────────────────────────────
+ * When tokens are burned (e.g. from SELL_BURN_BP), the factory reserve is also
+ * burned proportionally so the price floor rises monotonically.
+ * Currently SELL_BURN_BP = 0, so AutoBoost is inactive but infrastructure is in place.
  */
 contract nine527 is ERC20, ReentrancyGuard {
     address public immutable DEPLOYER;
-    
-    // Virtual liquidity parameters - these create the initial price curve
-    // Initial price: 10 ETH / 100,000,000 tokens = 0.0000001 ETH per token
-    uint256 public constant INITIAL_VIRTUAL_ETH = 10 * (10 ** 18);           // 10 virtual ETH
-    uint256 public constant INITIAL_TOKEN_RESERVE = 100000000 * (10 ** 18);  // 100M tokens (total supply)
 
-    ////////////////////////////////////////////////////////////////////////////////
+    // ── Virtual Liquidity ─────────────────────────────────────────────────────
+    // These constants are NEVER stored as real balances; they are added into
+    // every reserve read so that getEthReserve() > 0 even before any buys.
+    // Launch price = INITIAL_VIRTUAL_ETH / INITIAL_TOKEN_RESERVE = 2.1e-8 OKB/token.
+    uint256 public constant INITIAL_VIRTUAL_ETH    = 21 * (10 ** 18);           // 21 virtual OKB
+    uint256 public constant INITIAL_TOKEN_RESERVE  = 1000000000 * (10 ** 18);  // 1 B tokens (full supply)
+
+    ////////////////////////////////////////////////////////////////////////////
     // Market Configuration
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
 
-    uint256 public constant MARKET_OPEN_STAGE = 1; // Market is open
-    uint256 public constant MARKET_BUY_ETH_LIMIT = 0; // No limit per buy
+    // MARKET_OPEN_STAGE > 0 means trading is live; set to 0 to pause (would
+    // require making this mutable — currently always open).
+    uint256 public constant MARKET_OPEN_STAGE       = 1;
+    uint256 public constant MARKET_BUY_ETH_LIMIT    = 0; // 0 = no per-tx cap
 
-    // Whitelist configuration (disabled by default)
-    address public constant MARKET_WHITELIST_TOKEN = address(0);
-    uint256 public constant MARKET_WHITELIST_TOKEN_BP = 0; // No whitelist
-    uint256 public constant MARKET_WHITELIST_BASE_AMT = 10 * (10 ** 18);
+    // Whitelist: if MARKET_WHITELIST_TOKEN != address(0), buyers must hold
+    // enough of that token to receive their requested output.
+    // Both constants are 0/zero-address so the whitelist is completely disabled.
+    address public constant MARKET_WHITELIST_TOKEN      = address(0);
+    uint256 public constant MARKET_WHITELIST_TOKEN_BP   = 0;
+    uint256 public constant MARKET_WHITELIST_BASE_AMT   = 10 * (10 ** 18); // floor if BP calc is tiny
 
-    ////////////////////////////////////////////////////////////////////////////////
-    // Fee Configuration (in basis points, 1 BP = 0.01%)
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
+    // Fee Configuration (basis points: 1 BP = 0.01%, 10000 BP = 100%)
+    ////////////////////////////////////////////////////////////////////////////
 
-    uint256 public constant TRANSFER_BURN_BP = 0;   // 0% burn on transfers
-    uint256 public constant SELL_BURN_BP = 0;       // 0% burn on sells
-    
-    // Treasury fee on sells - set by deployer (0-300 BP = 0-3%)
+    uint256 public constant TRANSFER_BURN_BP  = 0;   // burn on wallet-to-wallet transfers
+    uint256 public constant SELL_BURN_BP      = 0;   // burn on sells (AutoBoost is inactive while 0)
+
+    // Set once at construction; immutable so users can trust the fee won't change.
     uint256 public immutable SELL_TREASURY_BP;
-    uint256 public constant MAX_TREASURY_BP = 300;  // Max 3%
+    uint256 public constant  MAX_TREASURY_BP  = 300; // hard cap: 3%
 
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
     // Anti-bot Configuration
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
 
-    uint256 public constant CONTRACT_CHECK_BUY_LEVEL = 3;  // 0: no check; 1: extcodesize; 2: tx.origin; 3: both
+    // Bit-field: controls which checks apply to buyers and sellers.
+    //   bit 0 (level & 1 == 1): extcodesize — rejects callers that are contracts
+    //   bit 1 (level >= 2):      tx.origin   — rejects calls via another contract
+    //   level 3 = both checks active (most restrictive)
+    // Note: extcodesize is bypassable in a constructor; tx.origin is the stronger guard.
+    uint256 public constant CONTRACT_CHECK_BUY_LEVEL  = 3;
     uint256 public constant CONTRACT_CHECK_SELL_LEVEL = 3;
 
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
     // State Variables
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
 
+    // Placeholder address used as the "factory reserve" wallet.
+    // Tokens minted here represent the unsold supply backing the virtual pool.
+    // Must be non-zero and must not equal address(this) to avoid self-transfer loops.
     address internal constant TOKEN_FACTORY_ADDR = 0x1111111111111111111111111111111111111111;
 
     address public treasuryAddr;
+
+    // Accumulated sell fees sitting inside the contract as real ETH.
+    // Tracked separately so they don't distort the AMM reserve calculation.
+    // Only withdrawable via withdrawTreasury().
     uint256 public treasuryAmtTotal;
 
-    // Flag to skip burn during internal transfers (buy/sell operations)
+    // Guards against double-burn: set to true inside _transferNoBurn so that
+    // the _update override skips the TRANSFER_BURN_BP deduction for buy/sell ops
+    // where burn is already handled (or intentionally absent).
     bool private _skipBurn;
 
-    // Store token metadata for display
     string private _tokenName;
     string private _tokenSymbol;
 
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
     // Events
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
 
     event BuyToken(address indexed user, uint256 tokenAmt, uint256 ethAmt);
     event SellToken(address indexed user, uint256 tokenAmt, uint256 ethAmt);
 
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
     // Constructor
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
 
     /**
-     * @dev Deploy a new token with custom parameters
-     * @param tokenName_ The name of the token (e.g., "My Token")
-     * @param tokenSymbol_ The symbol of the token (e.g., "MTK")
-     * @param treasuryBP_ Treasury fee in basis points (0-300, i.e., 0-3%)
-     * @param deployer_ Address of the token deployer/treasury (use address(0) for msg.sender)
+     * @dev Deploy a new token.
+     * @param tokenName_    Human-readable name (e.g. "Pepe Token")
+     * @param tokenSymbol_  Ticker symbol (e.g. "PEPE")
+     * @param treasuryBP_   Sell fee in basis points, 0–300 (0–3%).
+     *                      Immutable after deployment — users can verify on-chain.
+     * @param deployer_     Treasury / fee recipient.  Pass address(0) to use msg.sender.
+     *                      The factory passes msg.sender explicitly so the token records
+     *                      the end-user rather than the factory contract itself.
+     *
+     * All 1 B tokens are minted to TOKEN_FACTORY_ADDR (the virtual reserve).
+     * No real ETH is required — the virtual liquidity constants provide the
+     * initial price curve without a seed deposit.
      */
     constructor(
         string memory tokenName_,
@@ -99,86 +139,106 @@ contract nine527 is ERC20, ReentrancyGuard {
         require(bytes(tokenName_).length > 0, "!name");
         require(bytes(tokenSymbol_).length > 0, "!symbol");
         require(treasuryBP_ <= MAX_TREASURY_BP, "!treasuryBP>3%");
-        
-        _tokenName = tokenName_;
+
+        _tokenName   = tokenName_;
         _tokenSymbol = tokenSymbol_;
-        
-        // If deployer_ is zero address, use msg.sender (for direct deployment)
-        // Otherwise use the provided address (for factory deployment)
+
+        // Resolve deployer: zero-address means "direct deploy, use msg.sender".
+        // The factory always supplies the real user's address here.
         address actualDeployer = deployer_ == address(0) ? msg.sender : deployer_;
-        
-        DEPLOYER = actualDeployer;
-        treasuryAddr = actualDeployer;
+
+        DEPLOYER       = actualDeployer;
+        treasuryAddr   = actualDeployer;
         SELL_TREASURY_BP = treasuryBP_;
-        
-        // Mint initial token supply to the factory address (virtual reserve)
+
+        // Entire supply sits in the virtual reserve at launch; tokens leave this
+        // address only when users buy and return when users sell.
         _mint(TOKEN_FACTORY_ADDR, INITIAL_TOKEN_RESERVE);
     }
 
-    ////////////////////////////////////////////////////////////////////////////////
-    // View Functions
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
+    // View / Price Functions
+    ////////////////////////////////////////////////////////////////////////////
 
     /**
-     * @dev Returns the effective ETH reserve (virtual + real ETH - treasury)
-     * This is used for AMM price calculations
+     * @dev Effective ETH reserve used in all AMM calculations.
+     *
+     *   ethReserve = virtualETH + realETH_in_contract - accumulatedTreasuryFees
+     *
+     * We subtract treasuryAmtTotal because those ETH belong to the treasury, not
+     * the liquidity pool.  Counting them would inflate buy prices and deflate sell
+     * payouts for regular traders.
      */
     function getEthReserve() public view returns (uint256) {
         return INITIAL_VIRTUAL_ETH + address(this).balance - treasuryAmtTotal;
     }
 
     /**
-     * @dev Returns the token reserve held by the factory
+     * @dev Token reserve = tokens still held by the virtual-pool address.
+     * Decreases on buys, increases on sells.
      */
     function getTokenReserve() public view returns (uint256) {
         return balanceOf(TOKEN_FACTORY_ADDR);
     }
 
     /**
-     * @dev Calculate current token price in ETH (per token)
+     * @dev Spot price in ETH per whole token (scaled by 1e18 for precision).
+     * Derived directly from the AMM reserves: price = ethReserve / tokenReserve.
      */
     function getTokenPrice() public view returns (uint256) {
-        uint256 ethReserve = getEthReserve();
+        uint256 ethReserve   = getEthReserve();
         uint256 tokenReserve = getTokenReserve();
         if (tokenReserve == 0) return 0;
         return (ethReserve * 1e18) / tokenReserve;
     }
 
     /**
-     * @dev Estimate tokens received for a given ETH amount
+     * @dev Preview tokens received for `ethAmount` ETH (no fee on buys).
+     *
+     * Applies constant-product: newTokenReserve = k / newEthReserve.
+     * The "+ newEthReserve / 2" is integer rounding (round-half-up) so the
+     * estimate matches what buyToken actually computes.
      */
     function estimateBuyReturn(uint256 ethAmount) public view returns (uint256) {
         if (ethAmount == 0) return 0;
-        
-        uint256 oldEthReserve = getEthReserve();
-        uint256 newEthReserve = oldEthReserve + ethAmount;
+
+        uint256 oldEthReserve   = getEthReserve();
+        uint256 newEthReserve   = oldEthReserve + ethAmount;
         uint256 oldTokenReserve = getTokenReserve();
-        
-        // Constant product formula: x * y = k
-        // newTokenReserve = (oldEthReserve * oldTokenReserve) / newEthReserve
+
+        // Round-half-up division: (a * b + c/2) / c  ≈  a * b / c  with rounding
         uint256 newTokenReserve = (oldEthReserve * oldTokenReserve + newEthReserve / 2) / newEthReserve;
-        
+
         return oldTokenReserve - newTokenReserve;
     }
 
     /**
-     * @dev Estimate ETH received for selling tokens (after treasury fee)
+     * @dev Preview ETH received for selling `tokenAmount` tokens, after treasury fee.
+     *
+     * Steps:
+     *   1. Apply SELL_BURN_BP to determine tokens that enter the pool.
+     *   2. Compute new ETH reserve via constant-product.
+     *   3. Deduct SELL_TREASURY_BP from gross ETH output.
+     *
+     * This matches the logic in sellToken() exactly so callers get accurate quotes.
      */
     function estimateSellReturn(uint256 tokenAmount) public view returns (uint256) {
         if (tokenAmount == 0) return 0;
-        
-        uint256 burnAmt = (tokenAmount * SELL_BURN_BP) / 10000;
+
+        // Burned tokens don't enter the reserve — they're permanently removed.
+        uint256 burnAmt          = (tokenAmount * SELL_BURN_BP) / 10000;
         uint256 tokenAmtAfterBurn = tokenAmount - burnAmt;
-        
-        uint256 oldEthReserve = getEthReserve();
+
+        uint256 oldEthReserve   = getEthReserve();
         uint256 oldTokenReserve = getTokenReserve();
-        
+
         uint256 newTokenReserve = oldTokenReserve + tokenAmtAfterBurn;
-        uint256 newEthReserve = (oldEthReserve * oldTokenReserve + newTokenReserve / 2) / newTokenReserve;
-        
+        // Round-half-up to be consistent with buyToken rounding direction.
+        uint256 newEthReserve   = (oldEthReserve * oldTokenReserve + newTokenReserve / 2) / newTokenReserve;
+
         uint256 grossEth = oldEthReserve - newEthReserve;
-        
-        // Deduct treasury fee from output
+
+        // Treasury fee is taken from what the user receives, not from the pool math.
         if (SELL_TREASURY_BP > 0) {
             uint256 treasuryAmt = (grossEth * SELL_TREASURY_BP) / 10000;
             return grossEth - treasuryAmt;
@@ -187,7 +247,7 @@ contract nine527 is ERC20, ReentrancyGuard {
     }
 
     /**
-     * @dev Get token configuration info
+     * @dev Aggregate token info for UIs / the factory's batch query.
      */
     function getTokenInfo() external view returns (
         string memory tokenName,
@@ -209,94 +269,123 @@ contract nine527 is ERC20, ReentrancyGuard {
         );
     }
 
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
     // Trading Functions
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
 
     /**
-     * @dev Buy tokens with ETH
-     * @param minTokenAmt Minimum tokens to receive (slippage protection)
-     * @param expireTimestamp Transaction deadline (0 for no deadline)
+     * @dev Buy tokens with ETH.
+     *
+     * @param minTokenAmt      Slippage guard: revert if output < this value.
+     * @param expireTimestamp  Deadline in Unix seconds; 0 means no deadline.
+     *
+     * Reserve snapshot:
+     *   We read `address(this).balance` AFTER msg.value has landed (EVM adds it
+     *   before the call body executes), so `newEthReserve` already includes the
+     *   buyer's ETH.  We then back-calculate `oldEthReserve = newEthReserve - msg.value`
+     *   to run the AMM formula forward correctly.
+     *
+     * No fee on buys: all sent ETH enters the liquidity pool, raising the price.
      */
     function buyToken(uint256 minTokenAmt, uint256 expireTimestamp) external payable nonReentrant {
         address user = msg.sender;
 
-        // Anti-bot checks
+        // Anti-bot: level 3 applies both guards.
+        // extcodesize rejects contracts (bit 0); tx.origin rejects calls forwarded
+        // through intermediary contracts (bit 1).  Both can be circumvented in edge
+        // cases (constructor calls, flash-loan wrappers), so they're defence-in-depth.
         if (CONTRACT_CHECK_BUY_LEVEL % 2 == 1) require(!_isContract(user), "!human");
-        if (CONTRACT_CHECK_BUY_LEVEL >= 2) require(user == tx.origin, "!human");
+        if (CONTRACT_CHECK_BUY_LEVEL >= 2)      require(user == tx.origin,   "!human");
 
         require(MARKET_OPEN_STAGE > 0, "!market");
-        require(msg.value > 0, "!eth");
-        require(minTokenAmt > 0, "!minToken");
+        require(msg.value > 0,         "!eth");
+        require(minTokenAmt > 0,       "!minToken");
         require(expireTimestamp == 0 || block.timestamp <= expireTimestamp, "!expire");
         require(MARKET_BUY_ETH_LIMIT == 0 || msg.value <= MARKET_BUY_ETH_LIMIT, "!ethLimit");
 
-        // Calculate output using constant product formula
-        uint256 newEthReserve = INITIAL_VIRTUAL_ETH + address(this).balance - treasuryAmtTotal;
-        uint256 oldEthReserve = newEthReserve - msg.value;
+        // msg.value is already included in address(this).balance at this point.
+        uint256 newEthReserve   = INITIAL_VIRTUAL_ETH + address(this).balance - treasuryAmtTotal;
+        uint256 oldEthReserve   = newEthReserve - msg.value;
 
         uint256 oldTokenReserve = balanceOf(TOKEN_FACTORY_ADDR);
+        // Constant-product with round-half-up: gives buyer the rounding benefit.
         uint256 newTokenReserve = (oldEthReserve * oldTokenReserve + newEthReserve / 2) / newEthReserve;
 
         uint256 outTokenAmt = oldTokenReserve - newTokenReserve;
-        require(outTokenAmt > 0, "!outToken");
-        require(outTokenAmt >= minTokenAmt, "INSUFFICIENT_OUTPUT_AMOUNT");
+        require(outTokenAmt > 0,              "!outToken");
+        require(outTokenAmt >= minTokenAmt,   "INSUFFICIENT_OUTPUT_AMOUNT");
 
-        // Whitelist check (if enabled)
+        // Whitelist: limits how many tokens a user can accumulate based on their
+        // holding of an external "access" token.  Disabled when BP = 0.
         if (MARKET_WHITELIST_TOKEN_BP > 0 && MARKET_WHITELIST_TOKEN != address(0)) {
             uint256 amtWhitelistToken = IERC20(MARKET_WHITELIST_TOKEN).balanceOf(user);
             uint256 amtLimit = (amtWhitelistToken * MARKET_WHITELIST_TOKEN_BP) / 10000;
+            // Enforce a minimum allowance even for tiny whitelist-token holders.
             if (amtLimit < MARKET_WHITELIST_BASE_AMT) {
                 amtLimit = MARKET_WHITELIST_BASE_AMT;
             }
             require(balanceOf(user) + outTokenAmt <= amtLimit, "!need-more-whitelist-token");
         }
 
-        // Transfer tokens from factory to user (no burn on buy)
+        // _transferNoBurn bypasses TRANSFER_BURN_BP so that buying doesn't trigger
+        // the on-transfer burn — only explicit sell burns (SELL_BURN_BP) apply.
         _transferNoBurn(TOKEN_FACTORY_ADDR, user, outTokenAmt);
 
         emit BuyToken(user, outTokenAmt, msg.value);
     }
 
     /**
-     * @dev Sell tokens for ETH
-     * @param tokenAmt Amount of tokens to sell
-     * @param minEthAmt Minimum ETH to receive (slippage protection)
-     * @param expireTimestamp Transaction deadline (0 for no deadline)
+     * @dev Sell tokens for ETH.
+     *
+     * @param tokenAmt         Tokens to sell (gross, before burn).
+     * @param minEthAmt        Slippage guard: revert if ETH received < this.
+     * @param expireTimestamp  Deadline in Unix seconds; 0 means no deadline.
+     *
+     * Execution order matters:
+     *   1. Burn `burnAmt` from the seller's wallet (and AutoBoost-burn from reserve).
+     *   2. Transfer the remaining `tokenAmtAfterBurn` from seller → factory reserve.
+     *   3. Send ETH to seller, keeping treasury fee in the contract.
+     *
+     * Doing the burn BEFORE updating the reserve means the constant-product
+     * calculation uses the correct post-burn reserves.
      */
     function sellToken(uint256 tokenAmt, uint256 minEthAmt, uint256 expireTimestamp) external nonReentrant {
         address payable user = payable(msg.sender);
 
-        // Anti-bot checks
         if (CONTRACT_CHECK_SELL_LEVEL % 2 == 1) require(!_isContract(user), "!human");
-        if (CONTRACT_CHECK_SELL_LEVEL >= 2) require(user == tx.origin, "!human");
+        if (CONTRACT_CHECK_SELL_LEVEL >= 2)      require(user == tx.origin,   "!human");
 
-        require(tokenAmt > 0, "!token");
+        require(tokenAmt > 0,  "!token");
         require(minEthAmt > 0, "!minEth");
         require(expireTimestamp == 0 || block.timestamp <= expireTimestamp, "!expire");
 
-        // Apply sell burn (if any)
-        uint256 burnAmt = (tokenAmt * SELL_BURN_BP) / 10000;
+        // Step 1: burn (currently a no-op because SELL_BURN_BP = 0).
+        // AutoBoost inside _burnWithAutoBoost also burns from the factory reserve
+        // proportionally, so the price floor can only rise, never fall from burns.
+        uint256 burnAmt           = (tokenAmt * SELL_BURN_BP) / 10000;
         _burnWithAutoBoost(user, burnAmt);
         uint256 tokenAmtAfterBurn = tokenAmt - burnAmt;
 
-        // Calculate ETH output using constant product formula
-        uint256 oldEthReserve = INITIAL_VIRTUAL_ETH + address(this).balance - treasuryAmtTotal;
+        // Step 2: AMM calculation using the token reserve BEFORE the transfer so
+        // we compute the ETH owed, then move tokens in step 3.
+        uint256 oldEthReserve   = INITIAL_VIRTUAL_ETH + address(this).balance - treasuryAmtTotal;
         uint256 oldTokenReserve = balanceOf(TOKEN_FACTORY_ADDR);
 
         uint256 newTokenReserve = oldTokenReserve + tokenAmtAfterBurn;
-        uint256 newEthReserve = (oldEthReserve * oldTokenReserve + newTokenReserve / 2) / newTokenReserve;
+        uint256 newEthReserve   = (oldEthReserve * oldTokenReserve + newTokenReserve / 2) / newTokenReserve;
 
         uint256 outEthAmt = oldEthReserve - newEthReserve;
         require(outEthAmt > 0, "!outEth");
 
-        // Transfer tokens from user to factory (no additional burn)
+        // Step 3: move tokens back to the reserve (no burn on this internal transfer).
         _transferNoBurn(user, TOKEN_FACTORY_ADDR, tokenAmtAfterBurn);
 
-        // Send ETH to user (minus treasury fee if any)
+        // Step 4: pay seller and earmark treasury cut.
+        // treasuryAmtTotal stays in the contract; the treasury withdraws separately.
+        // This avoids an external call during the hot path and reduces reentrancy surface.
         if (SELL_TREASURY_BP > 0) {
-            uint256 treasuryAmt = (outEthAmt * SELL_TREASURY_BP) / 10000;
-            treasuryAmtTotal += treasuryAmt;
+            uint256 treasuryAmt  = (outEthAmt * SELL_TREASURY_BP) / 10000;
+            treasuryAmtTotal    += treasuryAmt;
             uint256 userReceives = outEthAmt - treasuryAmt;
             require(userReceives >= minEthAmt, "INSUFFICIENT_OUTPUT_AMOUNT");
             user.transfer(userReceives);
@@ -308,22 +397,28 @@ contract nine527 is ERC20, ReentrancyGuard {
         emit SellToken(user, tokenAmt, outEthAmt);
     }
 
-    ////////////////////////////////////////////////////////////////////////////////
-    // Internal Transfer Functions
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
+    // Internal Transfer / Burn Helpers
+    ////////////////////////////////////////////////////////////////////////////
 
     /**
-     * @dev Override _update to implement burn on transfers
+     * @dev ERC-20 balance-update hook — intercepts all mints, burns, and transfers.
+     *
+     * We piggyback TRANSFER_BURN_BP here so every wallet-to-wallet transfer
+     * automatically burns a fraction of the transferred amount.
+     *
+     * Skipped for:
+     *   - Mints (from == address(0)): would loop back into _mint.
+     *   - Burns (to   == address(0)): already a burn, no double-burn.
+     *   - _skipBurn == true: set by _transferNoBurn for AMM ops.
      */
     function _update(address from, address to, uint256 value) internal virtual override {
         super._update(from, to, value);
 
-        // Skip burn for minting, burning, or internal operations
         if (from == address(0) || to == address(0) || _skipBurn) {
             return;
         }
 
-        // Apply burn on regular transfers
         if (TRANSFER_BURN_BP > 0) {
             uint256 burnAmt = (value * TRANSFER_BURN_BP) / 10000;
             _burnWithAutoBoost(to, burnAmt);
@@ -331,8 +426,12 @@ contract nine527 is ERC20, ReentrancyGuard {
     }
 
     /**
-     * @dev Internal transfer that bypasses the burn mechanism
-     * Used for buy/sell operations where burn is handled separately
+     * @dev Transfer tokens while bypassing the transfer-burn logic.
+     *
+     * The _skipBurn flag is set for the duration of the internal _update call
+     * so the hook in _update sees it and skips the TRANSFER_BURN_BP deduction.
+     * This is safe within a single non-reentrant call; ReentrancyGuard on the
+     * public functions ensures _skipBurn can't be left true across external calls.
      */
     function _transferNoBurn(address sender, address recipient, uint256 amount) internal {
         _skipBurn = true;
@@ -341,9 +440,17 @@ contract nine527 is ERC20, ReentrancyGuard {
     }
 
     /**
-     * @dev Burns tokens with AutoBoost mechanism
-     * When tokens are burned, a proportional amount is also burned from the reserve
-     * This creates upward price pressure (rising floor price)
+     * @dev Burn `amount` from `account`, then proportionally burn from the factory
+     * reserve to maintain the price floor (AutoBoost).
+     *
+     * AutoBoost math:
+     *   extraBurn = reserveTokens × (burnAmt / circulatingSupply)
+     *
+     * Burning `burnAmt` from circulation shrinks supply; burning `extraBurn` from
+     * the reserve in the same ratio keeps the ratio (reserve / circulating) constant,
+     * which means the price floor (virtualETH / totalSupply) rises.
+     *
+     * No-ops when amount == 0 or when the account has no balance.
      */
     function _burnWithAutoBoost(address account, uint256 amount) internal {
         if (amount == 0) return;
@@ -352,12 +459,11 @@ contract nine527 is ERC20, ReentrancyGuard {
         if (account != TOKEN_FACTORY_ADDR) {
             _burn(account, amount);
 
-            // AutoBoost: proportionally reduce token reserve to boost floor price
-            // This ensures the price floor rises with each burn
-            uint256 tokenReserve = balanceOf(TOKEN_FACTORY_ADDR);
+            uint256 tokenReserve      = balanceOf(TOKEN_FACTORY_ADDR);
             uint256 circulatingSupply = totalSupply() - tokenReserve;
 
             if (circulatingSupply > 0 && tokenReserve > 0) {
+                // Integer math: may underestimate by 1; acceptable rounding loss.
                 uint256 extraBurn = (tokenReserve * amount) / circulatingSupply;
                 if (extraBurn > 0) {
                     _burn(TOKEN_FACTORY_ADDR, extraBurn);
@@ -367,36 +473,55 @@ contract nine527 is ERC20, ReentrancyGuard {
     }
 
     /**
-     * @dev Check if an address is a contract
+     * @dev Returns true if `account` has deployed bytecode (i.e. is a contract).
+     * Note: returns false during the target contract's own constructor, so a
+     * malicious contract can bypass this check by calling buyToken from its
+     * constructor.  Paired with tx.origin for stronger coverage.
      */
     function _isContract(address account) internal view returns (bool) {
         return account.code.length > 0;
     }
 
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
     // Treasury Functions
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
 
     modifier onlyTreasury() {
         require(msg.sender == treasuryAddr, "!treasury");
         _;
     }
 
+    /**
+     * @dev Transfer treasury role to a new address.
+     * The new address immediately becomes both the fee recipient and the only
+     * account that can call treasury functions.
+     */
     function setTreasuryAddr(address newTreasury) external onlyTreasury {
         require(newTreasury != address(0), "!zero");
         treasuryAddr = newTreasury;
     }
 
+    /**
+     * @dev Withdraw accumulated sell fees to the treasury address.
+     * `amt` is capped by `treasuryAmtTotal`; the rest of the contract's ETH
+     * balance is untouchable liquidity.
+     */
     function withdrawTreasury(uint256 amt) external onlyTreasury {
         require(amt <= treasuryAmtTotal, "amt exceeds treasury");
         treasuryAmtTotal -= amt;
         payable(treasuryAddr).transfer(amt);
     }
 
-    ////////////////////////////////////////////////////////////////////////////////
-    // Receive ETH (for adding liquidity or donations)
-    ////////////////////////////////////////////////////////////////////////////////
+    ////////////////////////////////////////////////////////////////////////////
+    // ETH Receive Hook
+    ////////////////////////////////////////////////////////////////////////////
 
+    /**
+     * @dev Accepts plain ETH transfers (e.g. donations or liquidity additions).
+     *
+     * Any ETH sent directly increases `address(this).balance` which raises
+     * `getEthReserve()`, thereby boosting the token price permanently.
+     * Unlike a buy, no tokens are minted or transferred — it's a pure price boost.
+     */
     receive() external payable {}
 }
-
